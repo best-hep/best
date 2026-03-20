@@ -21,7 +21,6 @@ import os
 import pickle
 import warnings
 
-
 # ======================================================================
 # Interpolation with power-law / exponential extrapolation
 # ======================================================================
@@ -64,11 +63,14 @@ class ExtrapolatingInterp:
         return np.sqrt(p**2 + self.mass**2)
 
     def _f_from_y(self, y):
-        """Recover f from y = log(1/f + eta)."""
         y = np.clip(y, -500, 500)
         if self.eta == 0.0:
             return np.exp(-y)
-        return np.where(y > 0, 1.0 / (np.exp(y) - self.eta + 1e-30), 0.0)
+        if self.eta == -1.0:  # fermion
+            return 1.0 / (np.exp(y) + 1.0)
+        # boson
+        return np.where(y > 0, 1.0 / (np.exp(y) - 1.0 + 1e-30), 0.0)
+
 
     def __call__(self, p):
         if isinstance(p, (int, float)):
@@ -176,6 +178,7 @@ class BEST:
 
         self.process_configs = {}
         self.vegas_integrators = {}
+        self._integrator_suffix = ''
         self._analytical_integrators = {}
 
         self.current_time = 0.0
@@ -286,11 +289,14 @@ class BEST:
     # Vegas integrator setup
     # ------------------------------------------------------------------
     def setup_collision_integrator(self, process_name, section=None, mode='net'):
-        if process_name not in self.vegas_integrators:
-            self.vegas_integrators[process_name] = {}
+        suffix = getattr(self, '_integrator_suffix', '')
+        proc_key = process_name + suffix
+
+        if proc_key not in self.vegas_integrators:
+            self.vegas_integrators[proc_key] = {}
 
         key = f"{section}_{mode}" if section is not None else mode
-        if key not in self.vegas_integrators[process_name]:
+        if key not in self.vegas_integrators[proc_key]:
             config = self.process_configs[process_name]
             n_integrate = config['n_in'] + config['n_out'] - 2
             domain = []
@@ -299,11 +305,11 @@ class BEST:
                     [self.q_min, self.q_max], [0, np.pi], [0, 2 * np.pi]
                 ])
             if self.world_rank == 0:
-                print(f"  Creating Vegas integrator for {process_name} ({mode}): "
+                print(f"  Creating Vegas integrator for {proc_key} ({mode}): "
                       f"{len(domain)} dimensions", flush=True)
-            self.vegas_integrators[process_name][key] = \
+            self.vegas_integrators[proc_key][key] = \
                 self._vegas.Integrator(domain, mpi=True)
-        return self.vegas_integrators[process_name][key]
+        return self.vegas_integrators[proc_key][key]
 
     # ------------------------------------------------------------------
     # Batch collision integrand (core)
@@ -670,21 +676,21 @@ class BEST:
 
                     else:
                         if n_in_s > 0:
-                            self.vegas_integrators.pop(process_name, None)
+                            self._integrator_suffix = '_out'
                             self._force_target_side = 'input'
                             k_in = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_in_s * k_in[species]
 
                         if n_out_s > 0:
-                            self.vegas_integrators.pop(process_name, None)
+                            self._integrator_suffix = '_in'
                             self._force_target_side = 'output'
                             k_out = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_out_s * k_out[species]
 
                         self._force_target_side = None
-                        self.vegas_integrators.pop(process_name, None)
+                        self._integrator_suffix = ''
 
             return species_rates
 
@@ -698,7 +704,8 @@ class BEST:
         input_species = config['input']
         output_species = config['output']
         species_rates = {}
-
+        all_sp = config['input'] + config['output']
+        masses = [self.species_mass.get(s, 0.0) for s in all_sp]
 
         for species in self.species_list:
             t_sp = time.time()
@@ -714,7 +721,7 @@ class BEST:
                 self._analytical_integrators[key] = \
                     CollisionIntegral2to2Analytical(
                         self.q_min, self.q_max, M_squared,
-                        n_F=n_F, grid='log')
+                        masses=masses, n_F=n_F, grid='log')
             ci = self._analytical_integrators[key]
 
             rates_local = np.zeros(n_r)
@@ -933,7 +940,7 @@ class BEST:
             f_predictor = {}
             for species in self.species_list:
                 f_predictor[species] = self.distributions_1d[species].copy()
-            k2 = self._compute_rates_all_species(coupling, n_F)
+            k2 = self._compute_rates_all_species(process_name, n_F)
 
             if self.world_rank == 0:
                 for species in self.species_list:
@@ -1075,11 +1082,6 @@ Replaces the massless-only version in besthep.py.
 Based on Ala-Mattinen et al., Phys. Rev. D 105, 123005 (2022), Appendix A.
 Equations (A8)-(A18) with general masses m1, m2, m3, m4.
 """
-
-import numpy as np
-from scipy.integrate import quad
-import warnings
-
 
 # ======================================================================
 # Angular integral kernels (general mass 2->2)
@@ -1312,7 +1314,7 @@ class CollisionIntegral2to2Analytical:
         m1, m2, m3, m4 = self.masses
         E1 = np.sqrt(p1**2 + m1**2)
         f1 = float(f_interp(p1))
-        prefactor = -2.0 / (2.0 * np.pi)**4 / (2.0 * E1)
+        prefactor = 2.0 / (2.0 * np.pi)**4 / (2.0 * E1)
 
         integrand = np.zeros((self.n_F, self.n_F))
         for i, p2 in enumerate(self.p_grid):
@@ -1346,7 +1348,7 @@ class CollisionIntegral2to2Analytical:
 
     def compute_rate(self, p1, f_interp, species_stat='boson'):
         return (self.compute_rate_BW(p1, f_interp, species_stat)
-                + self.compute_rate_FW(p1, f_interp, species_stat))
+                - self.compute_rate_FW(p1, f_interp, species_stat))
 
     def clear_cache(self):
         self._F_BW.clear()
