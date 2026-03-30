@@ -343,10 +343,18 @@ class BEST:
             target_idx = n_in + output_species.index(target_species)
             sign = -1
 
-        if n_in <= n_out:
-            candidates = [i for i in range(n_in) if i != target_idx]
+        if n_in == n_out:
+            # same side as target
+            if target_idx < n_in:
+                candidates = [i for i in range(n_in) if i != target_idx]
+            else:
+                candidates = [i for i in range(n_in, n_total) if i != target_idx]
         else:
-            candidates = [i for i in range(n_in, n_total) if i != target_idx]
+            # fewer-particle side
+            if n_in <= n_out:
+                candidates = [i for i in range(n_in) if i != target_idx]
+            else:
+                candidates = [i for i in range(n_in, n_total) if i != target_idx]
 
         if not candidates:
             candidates = [i for i in range(n_total) if i != target_idx]
@@ -549,9 +557,9 @@ class BEST:
                 if result.mean != 0:
                     rel_err = result.sdev / abs(result.mean)
                     dw_cur = self.adaptive_widths[key][r_index][mode]
-                    if rel_err > 0.5:
+                    if rel_err > 0.1:
                         self.adaptive_widths[key][r_index][mode] = dw_cur * 2.0
-                    elif rel_err < 0.01:
+                    elif rel_err < 0.0001:
                         self.adaptive_widths[key][r_index][mode] = dw_cur * 0.5
 
             rate_contrib = result_b.mean - result_f.mean
@@ -672,18 +680,20 @@ class BEST:
                         self._force_target_side = None
                         k = self._compute_rates_single_pass(
                             [process_name], t=t, species_filter=[species])
-                        species_rates[species] += (n_in_s + n_out_s) * k[species]
+                        symmetric = sorted(input_species) == sorted(output_species)
+                        mult = n_in_s if symmetric else (n_in_s + n_out_s)
+                        species_rates[species] += mult * k[species]
 
                     else:
                         if n_in_s > 0:
-                            self._integrator_suffix = '_out'
+                            self._integrator_suffix = '_in'
                             self._force_target_side = 'input'
                             k_in = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_in_s * k_in[species]
 
                         if n_out_s > 0:
-                            self._integrator_suffix = '_in'
+                            self._integrator_suffix = '_out'
                             self._force_target_side = 'output'
                             k_out = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
@@ -749,7 +759,9 @@ class BEST:
             self.world_comm.Allreduce(rates_local, rates, op=MPI.SUM)
             n_in_s = input_species.count(species)
             n_out_s = output_species.count(species)
-            species_rates[species] = (n_in_s + n_out_s) * rates
+            symmetric = sorted(input_species) == sorted(output_species)
+            mult = n_in_s if symmetric else (n_in_s + n_out_s)
+            species_rates[species] = mult * rates
 
             if self.world_rank == 0:
                 print(f"    [Analytical] done in {time.time()-t_sp:.1f}s, "
