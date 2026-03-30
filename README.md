@@ -27,6 +27,18 @@ scipy
 mpi4py
 vegas
 ```
+## Repository Structure
+```
+besthep.py          # Main solver
+examples/
+  2to2m1.py         # 2→2 massive thermalization
+  2to3m1.py         # 2→3 cannibal process
+scripts/
+  plot.py           # Plot evolution from checkpoint
+  compare_rates.py  # Vegas vs analytical benchmark
+requirements.txt
+LICENSE
+```
 
 ## Quick Start
 
@@ -119,18 +131,6 @@ Run with MPI:
 
 ```bash
 mpirun -np 8 python3 main.py
-```
-## Repository Structure
-```
-besthep.py          # Main solver
-examples/
-  2to2m1.py         # 2→2 massive thermalization
-  2to3m1.py         # 2→3 cannibal process
-scripts/
-  plot.py           # Plot evolution from checkpoint
-  compare_rates.py  # Vegas vs analytical benchmark
-requirements.txt
-LICENSE
 ```
 ### 2→3 number-changing process
 
