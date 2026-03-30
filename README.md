@@ -34,22 +34,85 @@ vegas
 
 ```python
 import numpy as np
+import os
 from besthep import BEST
 
+
+# ======================================================================
+# Matrix element
+# ======================================================================
 def matrix_element(momenta, coupling):
+    """Constant |M|^2. Symmetry factors included in coupling."""
     return np.full(momenta.shape[2], coupling**2)
 
-def init_f(r):
-    return 1.0 / (1 + np.exp((r - 3) / 2.0))
 
-solver = BEST(q_min=0.1, q_max=20.0, n_grid=64)
-solver.initialize_species('phi', init_f, stat='boson', mass=1.0)
-solver.add_process('elastic',
-    ['phi', 'phi'], ['phi', 'phi'],
-    matrix_element, coupling=1.0, neval=int(1e6), delta_width=0.01)
+# ======================================================================
+# Initial condition
+# ======================================================================
+def init_f(r, r0=3.0, width=2.0):
+    """Non-thermal sigmoid distribution."""
+    return 1.0 / (1 + np.exp((r - r0) / width))
 
-for step in range(100):
-    solver.evolve_step(dt=1.0, method='heun')
+
+# ======================================================================
+# Parameters
+# ======================================================================
+q_min    = 0.1
+q_max    = 50.0
+n_grid   = 128
+mass     = 1.0
+coupling = 1.0
+neval    = int(1e6)
+dt       = 1e2
+n_steps  = 1000
+checkpoint_file = "checkpoint.pkl"
+
+
+# ======================================================================
+# Setup
+# ======================================================================
+solver = BEST(q_min=q_min, q_max=q_max, n_grid=n_grid)
+
+resume = os.path.exists(checkpoint_file) and solver.world_rank == 0
+resume = solver.world_comm.bcast(resume, root=0)
+
+if resume:
+    history = solver.load_checkpoint(
+        checkpoint_file,
+        matrix_elements={'matrix_element': matrix_element})
+else:
+    solver.initialize_species('phi', init_f, stat='boson', mass=mass)
+    solver.add_process('2to2',
+                       ['phi', 'phi'], ['phi', 'phi'],
+                       matrix_element, coupling=coupling,
+                       neval=neval)
+
+    history = {'phi': {'f': [], 'n': [], 'e': []}, 'times': []}
+    m = solver.compute_moments()
+    history['phi']['f'].append(solver.distributions_1d['phi'].copy())
+    history['phi']['n'].append(m['phi']['n'])
+    history['phi']['e'].append(m['phi']['e'])
+    history['times'].append(0.0)
+
+
+# ======================================================================
+# Evolution
+# ======================================================================
+for step in range(n_steps):
+    solver.evolve_step(dt=dt)
+
+    m = solver.compute_moments()
+    history['phi']['f'].append(solver.distributions_1d['phi'].copy())
+    history['phi']['n'].append(m['phi']['n'])
+    history['phi']['e'].append(m['phi']['e'])
+    history['times'].append(solver.current_time)
+
+    if solver.world_rank == 0:
+        N0, E0 = history['phi']['n'][0], history['phi']['e'][0]
+        print(f"  N/N0={m['phi']['n']/N0:.6f}  "
+              f"E/E0={m['phi']['e']/E0:.6f}")
+
+    solver.save_checkpoint(checkpoint_file, history=history)
 ```
 
 Run with MPI:
