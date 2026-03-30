@@ -153,7 +153,7 @@ solver.set_radiation_dominated(a0=1.0, t0=solver.current_time)
 
 ```python
 solver.initialize_species('chi', init_chi, stat='fermion', mass=5.0)
-solver.initialize_species('phi', init_phi, stat='boson', mass=0.0)
+solver.initialize_species('phi', init_phi, stat='boson', mass=1.0)
 solver.add_process('annihilation',
     ['chi', 'chi'], ['phi', 'phi'],
     matrix_element_ann, coupling=0.1, neval=int(1e6))
