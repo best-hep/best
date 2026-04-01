@@ -180,23 +180,24 @@ If you use BEST in your work, please cite:
 BibTeX:
 
 ```bibtex
-@article{Yoon:2026best,
+@article{Yoon:2026rce,
     author = "Yoon, Jong-Hyun",
     title = "{Boltzmann Equation Solver for Thermalization}",
-    year = "2026",
     eprint = "2603.28848",
     archivePrefix = "arXiv",
-    primaryClass = "hep-ph"
+    primaryClass = "hep-ph",
+    month = "3",
+    year = "2026"
 }
 ```
 
 LaTeX:
 
 ```tex
-%\cite{Yoon:2026best}
-\bibitem{Yoon:2026best}
+%\cite{Yoon:2026rce}
+\bibitem{Yoon:2026rce}
 J.~H.~Yoon,
-``Boltzmann Equation Solver for Thermalization,''
+%``Boltzmann Equation Solver for Thermalization,''
 [arXiv:2603.28848 [hep-ph]].
 ```
 
