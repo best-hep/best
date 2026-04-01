@@ -184,7 +184,7 @@ BibTeX:
     author = "Yoon, Jong-Hyun",
     title = "{Boltzmann Equation Solver for Thermalization}",
     year = "2026",
-    eprint = "XXXX.XXXXX",
+    eprint = "2603.28848",
     archivePrefix = "arXiv",
     primaryClass = "hep-ph"
 }
@@ -197,7 +197,7 @@ LaTeX:
 \bibitem{Yoon:2026best}
 J.~H.~Yoon,
 ``Boltzmann Equation Solver for Thermalization,''
-[arXiv:XXXX.XXXXX [hep-ph]].
+[arXiv:2603.28848 [hep-ph]].
 ```
 
 ## License
