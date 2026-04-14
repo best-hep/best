@@ -36,30 +36,36 @@ def fd_dist(p, T, mu, m):
     x = np.clip(x, -500, 500)
     return 1.0 / (np.exp(x) + 1.0)
 
-
+def mb_dist(p, T, mu, m):
+    E = energy(p, m)
+    x = (E - mu) / T
+    x = np.clip(x, -500, 500)
+    return np.exp(-x)
 # ======================================================================
 # Predict equilibrium T (and mu) from conservation laws
 # ======================================================================
-def predict_equilibrium(E0, N0, mass, stat, q_min, q_max, number_changing):
+def predict_equilibrium(E0, N0, mass, stat, q_min, q_max, number_changing, a=1.0):
     if stat == 'boson':
-        dist = lambda p, T, mu: be_dist(p, T, mu, mass)
+        dist = lambda q, T, mu: be_dist(q / a, T, mu, mass)
+    elif stat == 'fermion':
+        dist = lambda q, T, mu: fd_dist(q / a, T, mu, mass)
     else:
-        dist = lambda p, T, mu: fd_dist(p, T, mu, mass)
-
+        dist = lambda q, T, mu: mb_dist(q / a, T, mu, mass)
+ 
     def E_integral(T, mu):
-        def integrand(p):
-            return p**2 * energy(p, mass) * dist(p, T, mu)
+        def integrand(q):
+            return q**2 * np.sqrt(q**2 + a**2 * mass**2) * dist(q, T, mu)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return 4 * np.pi * quad(integrand, q_min, q_max, limit=200)[0]
-
+ 
     def N_integral(T, mu):
-        def integrand(p):
-            return p**2 * dist(p, T, mu)
+        def integrand(q):
+            return q**2 * dist(q, T, mu)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return 4 * np.pi * quad(integrand, q_min, q_max, limit=200)[0]
-
+ 
     if number_changing:
         try:
             T_eq = brentq(lambda T: E_integral(T, 0.0) - E0, 0.01, 50.0)
@@ -158,7 +164,7 @@ def plot_evolution(state, history, output_file='evolution.png',
     q_min = state['q_min']
     q_max = state['q_max']
     times = np.array(history['times'])
-    species_list = [k for k in history.keys() if k != 'times']
+    species_list = [k for k in history.keys() if k not in ('times', 'a')]
 
     if max_snapshot is not None:
         max_snap = min(max_snapshot, len(times) - 1)
@@ -187,8 +193,9 @@ def plot_evolution(state, history, output_file='evolution.png',
 
         # Predict equilibrium
         print(f"\n{sp} ({stat}, m={mass}):")
+        a_final = history['a'][-1] if 'a' in history else 1.0
         T_eq, mu_eq = predict_equilibrium(
-            E0, N0, mass, stat, q_min, q_max, number_changing[sp])
+            E0, N0, mass, stat, q_min, q_max, number_changing[sp], a=a_final)
         if T_eq is not None:
             print(f"  Predicted: T_eq = {T_eq:.4f}, mu_eq = {mu_eq:.4f}")
 
@@ -213,18 +220,22 @@ def plot_evolution(state, history, output_file='evolution.png',
         # Equilibrium overlay
         if T_eq is not None:
             r_smooth = np.logspace(np.log10(q_min), np.log10(q_max), 300)
+            p_smooth = r_smooth / a_final
             if stat == 'boson':
-                f_eq = be_dist(r_smooth, T_eq, mu_eq, mass)
+                f_eq = be_dist(p_smooth, T_eq, mu_eq, mass)
+            elif stat == 'fermion':
+                f_eq = fd_dist(p_smooth, T_eq, mu_eq, mass)
             else:
-                f_eq = fd_dist(r_smooth, T_eq, mu_eq, mass)
-            mu_str = f', μ={mu_eq:.2f}' if not number_changing[sp] else ''
+                f_eq = mb_dist(p_smooth, T_eq, mu_eq, mass)
 
+            mu_str = f', μ={mu_eq:.2f}' if not number_changing[sp] else ''
+            stat_label = {'boson': 'BE', 'fermion': 'FD'}.get(stat, 'MB')
             if ymode == 'p2f':
                 ax1.semilogy(r_smooth, r_smooth**2 * f_eq, 'k--', lw=2,
-                             label=f'BE (T={T_eq:.2f}{mu_str})')
+                             label=f'{stat_label} (T={T_eq:.2f}{mu_str})')
             else:
                 ax1.semilogy(r_smooth, f_eq, 'k--', lw=2,
-                             label=f'BE (T={T_eq:.2f}{mu_str})')
+                             label=f'{stat_label} (T={T_eq:.2f}{mu_str})')
 
         ax1.set_xlabel('|p|')
         ax1.set_ylabel(r'$p^2 f(p)$' if ymode == 'p2f' else r'$f(p)$')

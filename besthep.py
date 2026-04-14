@@ -199,8 +199,11 @@ class BEST:
 
     def set_radiation_dominated(self, a0=1.0, t0=1.0):
         self.scale_factor = lambda t, _a0=a0, _t0=t0: _a0 * (t / _t0)**0.5
+        if self.current_time == 0.0:
+            self.current_time = t0
         if self.world_rank == 0:
             print(f"Scale factor: radiation dominated, a0={a0}, t0={t0}")
+            print(f"  current_time = {self.current_time}")
     # ------------------------------------------------------------------
     # Species energy function (supports massive particles)
     # ------------------------------------------------------------------
@@ -532,7 +535,8 @@ class BEST:
             dw_default = config.get('delta_width', 0.01)
 
             # Get adaptive widths (or initialize from default)
-            key = process_name
+            suffix = getattr(self, '_integrator_suffix', '')
+            key = process_name + suffix
             if key not in self.adaptive_widths:
                 self.adaptive_widths[key] = {}
             if r_index not in self.adaptive_widths[key]:
@@ -675,30 +679,33 @@ class BEST:
                     if n_in_s == 0 and n_out_s == 0:
                         continue
 
-
-                    if n_in_s == n_out_s:
+                    symmetric = sorted(input_species) == sorted(output_species)
+ 
+                    if n_in_s == n_out_s and symmetric:
+                        # Symmetric process: C_in = C_out by relabeling.
+                        # Compute once, multiply by n_in_s.
                         self._force_target_side = None
                         k = self._compute_rates_single_pass(
                             [process_name], t=t, species_filter=[species])
-                        symmetric = sorted(input_species) == sorted(output_species)
-                        mult = n_in_s if symmetric else (n_in_s + n_out_s)
-                        species_rates[species] += mult * k[species]
-
+                        species_rates[species] += n_in_s * k[species]
+ 
                     else:
+                        # Asymmetric process OR n_in_s != n_out_s:
+                        # C_in != C_out, must compute both sides separately.
                         if n_in_s > 0:
                             self._integrator_suffix = '_in'
                             self._force_target_side = 'input'
                             k_in = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_in_s * k_in[species]
-
+ 
                         if n_out_s > 0:
                             self._integrator_suffix = '_out'
                             self._force_target_side = 'output'
                             k_out = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_out_s * k_out[species]
-
+ 
                         self._force_target_side = None
                         self._integrator_suffix = ''
 
@@ -760,7 +767,10 @@ class BEST:
             n_in_s = input_species.count(species)
             n_out_s = output_species.count(species)
             symmetric = sorted(input_species) == sorted(output_species)
-            mult = n_in_s if symmetric else (n_in_s + n_out_s)
+            if symmetric:
+                mult = n_in_s
+            else:
+                mult = n_in_s + n_out_s
             species_rates[species] = mult * rates
 
             if self.world_rank == 0:
@@ -978,15 +988,77 @@ class BEST:
         return k1
 
     # ------------------------------------------------------------------
+    # History helpers
+    # ------------------------------------------------------------------
+    def init_history(self):
+        """Initialize history dict for all registered species.
+ 
+        Returns a dict with keys 'times' and one sub-dict per species,
+        each containing lists for 'f', 'n', 'e'.
+        The initial state (t = current_time) is recorded automatically.
+ 
+        Usage:
+            history = solver.init_history()
+        """
+        history = {'times': [], 'a': []}
+        for species in self.species_list:
+            history[species] = {'f': [], 'n': [], 'e': []}
+        m = self.compute_moments()
+        for species in self.species_list:
+            history[species]['f'].append(
+                self.distributions_1d[species].copy())
+            history[species]['n'].append(m[species]['n'])
+            history[species]['e'].append(m[species]['e'])
+        history['a'].append(self.scale_factor(self.current_time))
+        history['times'].append(self.current_time)
+        return history
+ 
+    def record(self, history):
+        """Record current state into history for all species.
+ 
+        Appends distribution, number density, and energy density
+        for every species in self.species_list, plus the current time.
+        Returns the moments dict so callers can print diagnostics
+        without calling compute_moments() again.
+ 
+        Usage:
+            m = solver.record(history)
+            print(f"E = {m['phi']['e']}")
+        """
+        m = self.compute_moments()
+        for species in self.species_list:
+            if species not in history:
+                history[species] = {'f': [], 'n': [], 'e': []}
+            history[species]['f'].append(
+                self.distributions_1d[species].copy())
+            history[species]['n'].append(m[species]['n'])
+            history[species]['e'].append(m[species]['e'])
+        if 'a' not in history:
+            history['a'] = []
+        history['a'].append(self.scale_factor(self.current_time))
+        history['times'].append(self.current_time)
+        return m
+
+    # ------------------------------------------------------------------
     # Moments
     # ------------------------------------------------------------------
     def compute_moments(self):
+        """Compute comoving number and energy densities.
+
+        n = 4π ∫ f(q) q² dq              ∝ a³ n_phys
+        e = 4π ∫ f(q) q² √(q²+a²m²) dq  ∝ a⁴ ρ_phys
+
+        For H=0 (a=1), these reduce to physical quantities.
+        """
         moments = {}
+        a = self.scale_factor(self.current_time)
+        for s, func in self.species_mass_func.items():
+            self.species_mass[s] = func(self.current_time)
         for species in self.species_list:
             f = self.distributions_1d[species]
             r_grid = self.r_grids[species]
             m = self.species_mass.get(species, 0.0)
-            E_grid = np.sqrt(r_grid**2 + m**2)
+            E_grid = np.sqrt(r_grid**2 + a**2 * m**2)
             n = np.trapezoid(f * r_grid**2, r_grid) * 4 * np.pi
             e = np.trapezoid(f * r_grid**2 * E_grid, r_grid) * 4 * np.pi
             moments[species] = {'n': n, 'e': e}

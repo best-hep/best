@@ -53,12 +53,7 @@ else:
                        matrix_element, coupling=coupling,
                        neval=neval)
 
-    history = {'phi': {'f': [], 'n': [], 'e': []}, 'times': []}
-    m = solver.compute_moments()
-    history['phi']['f'].append(solver.distributions_1d['phi'].copy())
-    history['phi']['n'].append(m['phi']['n'])
-    history['phi']['e'].append(m['phi']['e'])
-    history['times'].append(0.0)
+    history = solver.init_history()
 
 # ======================================================================
 # Evolution
@@ -66,11 +61,7 @@ else:
 for step in range(n_steps):
     solver.evolve_step(dt=dt, method='euler')
 
-    m = solver.compute_moments()
-    history['phi']['f'].append(solver.distributions_1d['phi'].copy())
-    history['phi']['n'].append(m['phi']['n'])
-    history['phi']['e'].append(m['phi']['e'])
-    history['times'].append(solver.current_time)
+    m = solver.record(history)
 
     if solver.world_rank == 0:
         N0, E0 = history['phi']['n'][0], history['phi']['e'][0]
