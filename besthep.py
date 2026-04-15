@@ -516,6 +516,8 @@ class BEST:
             self.adaptive_widths = {}
         
         total_rate = 0.0
+        total_forward = 0.0
+        total_backward = 0.0
 
         for process_name in active_processes:
             config = self.process_configs[process_name]
@@ -567,6 +569,8 @@ class BEST:
                         self.adaptive_widths[key][r_index][mode] = dw_cur * 0.5
 
             rate_contrib = result_b.mean - result_f.mean
+            total_forward += result_f.mean
+            total_backward += result_b.mean
 
             for result, rname in [(result_f, 'forward'), (result_b, 'backward')]:
                 if result.mean != 0:
@@ -583,7 +587,7 @@ class BEST:
                     self.error_stats['neglected'] += 1
 
             total_rate += rate_contrib
-        return total_rate
+        return total_rate, total_forward, total_backward
 
     # ------------------------------------------------------------------
     # Rate computation over grid (Vegas)
@@ -597,6 +601,8 @@ class BEST:
         for s, func in self.species_mass_func.items():
             self.species_mass[s] = func(t)
         species_rates = {}
+        species_forward = {}
+        species_backward = {}
         compute_list = species_filter if species_filter else self.species_list
         for species in compute_list:
             t_sp = time.time()
@@ -609,6 +615,8 @@ class BEST:
 
             n_r = len(self.r_grids[species])
             rates_local = np.zeros_like(self.r_grids[species])
+            fwd_local = np.zeros_like(rates_local)
+            bwd_local = np.zeros_like(rates_local)
 
             block_size = n_r // self.n_r_parallel
             remainder = n_r % self.n_r_parallel
@@ -623,7 +631,7 @@ class BEST:
                 r = self.r_grids[species][i]
                 if r < self.cutoff_zero:
                     continue
-                rates_local[i] = self.compute_collision_rate(
+                rates_local[i], fwd_local[i], bwd_local[i] = self.compute_collision_rate(
                     r, species, active_processes, r_index=i, t=t)
                 if (self.sub_rank == 0
                         and (idx + 1) % max(1, len(my_r_indices) // 5) == 0):
@@ -639,16 +647,24 @@ class BEST:
 
             if self.sub_rank != 0:
                 rates_local[:] = 0.0
+                fwd_local[:] = 0.0
+                bwd_local[:] = 0.0
 
             rates = np.zeros_like(rates_local)
+            fwd = np.zeros_like(fwd_local)
+            bwd = np.zeros_like(bwd_local)
             self.world_comm.Allreduce(rates_local, rates, op=MPI.SUM)
+            self.world_comm.Allreduce(fwd_local, fwd, op=MPI.SUM)
+            self.world_comm.Allreduce(bwd_local, bwd, op=MPI.SUM)
             species_rates[species] = rates
+            species_forward[species] = fwd
+            species_backward[species] = bwd
 
             if self.world_rank == 0:
                 print(f"    [Vegas] done in {time.time()-t_sp:.1f}s, "
                       f"max|C|={np.max(np.abs(rates)):.3e}")
 
-        return species_rates
+        return species_rates, species_forward, species_backward
 
     def _compute_rates_vegas(self, active_processes, t=0.0):
             """Compute collision rates with slot summation for n_in != n_out.
@@ -666,6 +682,8 @@ class BEST:
 
             species_rates = {sp: np.zeros_like(self.r_grids[sp])
                             for sp in self.species_list}
+            species_forward = {sp: np.zeros_like(self.r_grids[sp]) for sp in self.species_list}
+            species_backward = {sp: np.zeros_like(self.r_grids[sp]) for sp in self.species_list}
 
             for process_name in active_processes:
                 config = self.process_configs[process_name]
@@ -685,31 +703,35 @@ class BEST:
                         # Symmetric process: C_in = C_out by relabeling.
                         # Compute once, multiply by n_in_s.
                         self._force_target_side = None
-                        k = self._compute_rates_single_pass(
+                        k, kf, kb = self._compute_rates_single_pass(
                             [process_name], t=t, species_filter=[species])
                         species_rates[species] += n_in_s * k[species]
- 
+                        species_forward[species] += n_in_s * kf[species]
+                        species_backward[species] += n_in_s * kb[species] 
                     else:
                         # Asymmetric process OR n_in_s != n_out_s:
                         # C_in != C_out, must compute both sides separately.
                         if n_in_s > 0:
                             self._integrator_suffix = '_in'
                             self._force_target_side = 'input'
-                            k_in = self._compute_rates_single_pass(
+                            k_in, kf_in, kb_in = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_in_s * k_in[species]
- 
+                            species_forward[species] += n_in_s * kf_in[species]
+                            species_backward[species] += n_in_s * kb_in[species]
                         if n_out_s > 0:
                             self._integrator_suffix = '_out'
                             self._force_target_side = 'output'
-                            k_out = self._compute_rates_single_pass(
+                            k_out, kf_out, kb_out = self._compute_rates_single_pass(
                                 [process_name], t=t, species_filter=[species])
                             species_rates[species] += n_out_s * k_out[species]
+                            species_forward[species] += n_out_s * kf_out[species]
+                            species_backward[species] += n_out_s * kb_out[species]
  
                         self._force_target_side = None
                         self._integrator_suffix = ''
 
-            return species_rates
+            return species_rates, species_forward, species_backward
 
 
     # ------------------------------------------------------------------
@@ -801,7 +823,9 @@ class BEST:
         self.interpolators = self.world_comm.bcast(self.interpolators, root=0)
 
         # k1
-        k1 = self._compute_rates_vegas(active_processes, t=self.current_time)
+        k1, k1_fwd, k1_bwd = self._compute_rates_vegas(active_processes, t=self.current_time)
+        self.forward_rates = k1_fwd
+        self.backward_rates = k1_bwd
 
         # Adaptive dt
         dt_actual = dt
@@ -857,7 +881,7 @@ class BEST:
             for species in self.species_list:
                 f_predictor[species] = self.distributions_1d[species].copy()
 
-            k2 = self._compute_rates_vegas(active_processes, t=self.current_time + dt_actual)
+            k2, _, _ = self._compute_rates_vegas(active_processes, t=self.current_time + dt_actual)
 
             if self.world_rank == 0:
                 for species in self.species_list:
