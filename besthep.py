@@ -243,10 +243,12 @@ class BEST:
             print(f"Added process {name}: {input_species} -> {output_species} "
                   f"(neval={neval}, nitn={nitn}, delta_width={delta_width})")
 
-    def set_species(self, name, stat='boson', mass=0.0):
+    def set_species(self, name, stat='boson', mass=0.0, dof=1):
         """Set species statistics and mass."""
         self.species_config[name] = stat
         self.species_mass[name] = mass
+        self.species_dof = getattr(self, 'species_dof', {})
+        self.species_dof[name] = dof
         if self.world_rank == 0:
             print(f"Species {name}: stat={stat}, mass={mass}")
 
@@ -254,9 +256,13 @@ class BEST:
     # Species initialization
     # ------------------------------------------------------------------
     def initialize_species(self, species, init_func, grid='log',
-                           stat='boson', mass=0.0):
+                           stat='boson', mass=0.0, dof=None):
         """Initialize species distribution on a fixed grid.
         grid: 'log' or 'linear'."""
+        if dof is None:
+            dof = 2 if stat == 'fermion' else 1
+        self.species_dof = getattr(self, 'species_dof', {})
+        self.species_dof[species] = dof
         self.species_config[species] = stat
         self.species_mass[species] = mass
         self.species_list = list(self.species_config.keys())
@@ -1069,9 +1075,11 @@ class BEST:
     def compute_moments(self):
         """Compute comoving number and energy densities.
 
-        n = 4π ∫ f(q) q² dq              ∝ a³ n_phys
-        e = 4π ∫ f(q) q² √(q²+a²m²) dq  ∝ a⁴ ρ_phys
+        n = g ∫ d³q/(2π)³ f(q)                      ∝ a³ n_phys
+        e = g ∫ d³q/(2π)³ f(q) √(q²+a²m²)           ∝ a⁴ ρ_phys
 
+        where g = species_dof (internal degrees of freedom).
+        d³q = 4π q² dq after angular integration.
         For H=0 (a=1), these reduce to physical quantities.
         """
         moments = {}
@@ -1082,9 +1090,11 @@ class BEST:
             f = self.distributions_1d[species]
             r_grid = self.r_grids[species]
             m = self.species_mass.get(species, 0.0)
+            g = self.species_dof.get(species, 1)
             E_grid = np.sqrt(r_grid**2 + a**2 * m**2)
-            n = np.trapezoid(f * r_grid**2, r_grid) * 4 * np.pi
-            e = np.trapezoid(f * r_grid**2 * E_grid, r_grid) * 4 * np.pi
+            norm = g / (2 * np.pi)**3 * 4 * np.pi  # = g / (2π²)
+            n = np.trapezoid(f * r_grid**2, r_grid) * norm
+            e = np.trapezoid(f * r_grid**2 * E_grid, r_grid) * norm
             moments[species] = {'n': n, 'e': e}
         return moments
 
@@ -1102,6 +1112,7 @@ class BEST:
             process_configs_ser[name] = cc
 
         state = {
+            'species_dof': getattr(self, 'species_dof', {}),
             'species_config': self.species_config,
             'species_mass': self.species_mass,
             'q_min': self.q_min, 'q_max': self.q_max, 'n_grid': self.n_grid,
@@ -1130,7 +1141,7 @@ class BEST:
         else:
             state = None
         state = self.world_comm.bcast(state, root=0)
-
+        self.species_dof = state.get('species_dof', {s: 1 for s in self.species_list})
         self.species_config = state['species_config']
         self.species_mass = state.get('species_mass', {})
         self.species_list = list(self.species_config.keys())
