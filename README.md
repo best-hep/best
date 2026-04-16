@@ -19,6 +19,11 @@ Key features:
 
 ## Installation
 
+```bash
+git clone https://github.com/best-hep/best.git
+cd best
+```
+
 No installation required. Clone the repository and ensure the following dependencies are available:
 
 ```
