@@ -5,8 +5,13 @@ Computes C[f](p) once from the same initial distribution using both methods.
 Run: mpirun -np <N> python3 compare_rates.py
 """
 import numpy as np
-import os
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from besthep import BEST
+
+
+M_MED = 5.0
+GAMMA = 1.0
 
 # ======================================================================
 # Matrix element
@@ -16,6 +21,17 @@ def matrix_element_constant(momenta, coupling):
         return np.full(momenta.shape[2], coupling**2)
     return coupling**2
 
+def matrix_element_tchannel(momenta, coupling):
+    """Vegas: t-channel Breit-Wigner, t = (p1 - p3)^2."""
+    E1 = np.sqrt(np.sum(momenta[0]**2, axis=0) + mass**2)
+    E3 = np.sqrt(np.sum(momenta[2]**2, axis=0) + mass**2)
+    dp = momenta[0] - momenta[2]
+    t = (E1 - E3)**2 - np.sum(dp**2, axis=0)
+    return coupling**2 / ((t - M_MED**2)**2 + (GAMMA * M_MED)**2)
+
+def M_squared_tchannel(t):
+    """Analytical: same Breit-Wigner as a function of t."""
+    return coupling**2 / ((t - M_MED**2)**2 + (GAMMA * M_MED)**2)
 # ======================================================================
 # Initial condition
 # ======================================================================
@@ -64,7 +80,7 @@ solver.add_process(
 if solver.world_rank == 0:
     print("\n=== Computing Vegas rates ===")
 
-rates_vegas = solver._compute_rates_vegas(
+rates_vegas, _, _ = solver._compute_rates_vegas(
     list(solver.process_configs.keys()), t=0.0)
 
 # ======================================================================
@@ -73,7 +89,7 @@ rates_vegas = solver._compute_rates_vegas(
 if solver.world_rank == 0:
     print("\n=== Computing Analytical rates ===")
 
-rates_anal = solver._compute_rates_all_species('phi_2to2', n_F=n_grid)
+rates_anal = solver._compute_rates_all_species('phi_2to2', n_F=n_grid, M_squared=None)
 
 # ======================================================================
 # Save and plot (rank 0 only)

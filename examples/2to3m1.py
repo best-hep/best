@@ -1,10 +1,11 @@
 """
 BESThep example: thermalization via 2<->3 cannibal process.
 
-Run: mpirun -np 272 python run_2to3_massive.py
+Run: mpirun -np 272 python 2to3m1.py
 """
 import numpy as np
-import os
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from besthep import BEST
 
 # ======================================================================

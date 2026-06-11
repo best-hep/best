@@ -38,6 +38,7 @@ besthep.py          # Main solver
 examples/
   2to2m1.py         # 2→2 massive thermalization
   2to3m1.py         # 2→3 cannibal process
+  propagator.py     # momentum-dependent matrix element (s-/t-channel)
 scripts/
   plot.py           # Plot evolution from checkpoint
   compare_rates.py  # Vegas vs analytical benchmark

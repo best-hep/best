@@ -2,7 +2,7 @@
 """
 Plot evolution with equilibrium overlay from BEST checkpoint.
 Interactive mode: prompts for all options.
-Usage: python plot_evolution.py [checkpoint_file]
+Usage: python3 plot.py [checkpoint_file]
 """
 import numpy as np
 import matplotlib.pyplot as plt
@@ -44,7 +44,7 @@ def mb_dist(p, T, mu, m):
 # ======================================================================
 # Predict equilibrium T (and mu) from conservation laws
 # ======================================================================
-def predict_equilibrium(E0, N0, mass, stat, q_min, q_max, number_changing, a=1.0):
+def predict_equilibrium(E0, N0, mass, stat, q_min, q_max, number_changing, g=1, a=1.0):
     if stat == 'boson':
         dist = lambda q, T, mu: be_dist(q / a, T, mu, mass)
     elif stat == 'fermion':
@@ -57,14 +57,14 @@ def predict_equilibrium(E0, N0, mass, stat, q_min, q_max, number_changing, a=1.0
             return q**2 * np.sqrt(q**2 + a**2 * mass**2) * dist(q, T, mu)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return 4 * np.pi * quad(integrand, q_min, q_max, limit=200)[0]
+            return g / (2*np.pi)**3 * 4 * np.pi * quad(integrand, q_min, q_max, limit=200)[0]
  
     def N_integral(T, mu):
         def integrand(q):
             return q**2 * dist(q, T, mu)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return 4 * np.pi * quad(integrand, q_min, q_max, limit=200)[0]
+            return g / (2*np.pi)**3 * 4 * np.pi * quad(integrand, q_min, q_max, limit=200)[0]
  
     if number_changing:
         try:
@@ -161,6 +161,7 @@ def plot_evolution(state, history, output_file='evolution.png',
     species_config = state['species_config']
     species_mass = state.get('species_mass', {})
     process_configs = state.get('process_configs', {})
+    species_dof = state.get('species_dof')
     q_min = state['q_min']
     q_max = state['q_max']
     times = np.array(history['times'])
@@ -188,6 +189,7 @@ def plot_evolution(state, history, output_file='evolution.png',
     for sp in species_list:
         mass = species_mass.get(sp, 0.0)
         stat = species_config.get(sp, 'boson')
+        g = species_dof[sp]
         N0 = history[sp]['n'][0]
         E0 = history[sp]['e'][0]
 
@@ -195,7 +197,7 @@ def plot_evolution(state, history, output_file='evolution.png',
         print(f"\n{sp} ({stat}, m={mass}):")
         a_final = history['a'][-1] if 'a' in history else 1.0
         T_eq, mu_eq = predict_equilibrium(
-            E0, N0, mass, stat, q_min, q_max, number_changing[sp], a=a_final)
+            E0, N0, mass, stat, q_min, q_max, number_changing[sp], g=g, a=a_final)
         if T_eq is not None:
             print(f"  Predicted: T_eq = {T_eq:.4f}, mu_eq = {mu_eq:.4f}")
 

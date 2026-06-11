@@ -136,7 +136,53 @@ class BEST:
     cutoff_zero = 1e-50
     cutoff_energy_min = 1e-50
 
-    def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None):
+    def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3, adapt_width=True, max_rel_err=0.1, min_rel_err=0.01):
+        """Initialize the Boltzmann solver.
+
+        Parameters
+        ----------
+        q_min, q_max : float
+            Lower and upper bounds of the (comoving) momentum grid.
+        n_grid : int
+            Number of momentum grid points per species.
+        n_r_parallel : int or None
+            Number of MPI groups over which the momentum grid is split.
+            The world ranks are divided into n_r_parallel groups, and the
+            grid points are partitioned into that many contiguous blocks,
+            one per group. Within a group, the ranks share each point's
+            Vegas integration (via MPI), and the group processes the
+            points in its block sequentially. Default (None) uses one
+            rank per group (n_r_parallel = world_size): each rank handles
+            its own block of grid points and integrates each point alone.
+            A smaller value places more ranks on each integration (faster
+            per point) at the cost of fewer groups (more points per group
+            to process sequentially).
+        max_rel_change : float
+            Adaptive time-step control: the step is reduced so that the
+            maximum relative change of f per step, max_p |dt C[f]/f|,
+            stays below this value. Smaller values improve accuracy at
+            the cost of more steps.
+        adapt_width : bool
+            If True, the Gaussian energy-conservation width is adapted
+            per grid point from the Monte Carlo relative error (rel_err):
+            widened when rel_err > max_rel_err to stabilize the integral,
+            narrowed when rel_err < min_rel_err to tighten energy
+            conservation. If False, the width is held fixed at the
+            per-process delta_width (set in add_process).
+        max_rel_err : float
+            Upper rel_err threshold; above it the adaptive width is
+            widened. Acts as the largest statistical error tolerated
+            before sacrificing energy-conservation tightness for
+            integration stability.
+        min_rel_err : float
+            Lower rel_err threshold; below it the adaptive width is
+            narrowed. With limited neval, rel_err may never fall this
+            low, so the width stops narrowing and the evolution can
+            slow; raising min_rel_err then lets the width narrow at the
+            achievable accuracy. As neval grows and rel_err drops,
+            min_rel_err can be lowered again to tighten conservation.
+        """
+
         # ---- MPI setup ----
         self.world_comm = MPI.COMM_WORLD
         self.world_rank = self.world_comm.Get_rank()
@@ -171,6 +217,10 @@ class BEST:
         self.q_min = q_min
         self.q_max = q_max
         self.n_grid = n_grid
+        self.max_rel_change = max_rel_change
+        self.adapt_width = adapt_width
+        self.max_rel_err = max_rel_err
+        self.min_rel_err = min_rel_err
 
         self.distributions_1d = {}
         self.interpolators = {}
@@ -517,7 +567,7 @@ class BEST:
     def compute_collision_rate(self, r_target, species, active_processes,
                             r_index=0, t=0.0):
         if not hasattr(self, 'error_stats'):
-            self.error_stats = {'dropped': 0, 'neglected': 0}
+            self.error_stats = {'dropped': 0, 'neglected': 0, 'rel_errs': []}
         if not hasattr(self, 'adaptive_widths'):
             self.adaptive_widths = {}
         
@@ -565,14 +615,15 @@ class BEST:
             result_b = integrator_b(batch_b, nitn=nitn, neval=neval, alpha=alpha)
 
             # Adapt widths based on rel_err
-            for result, mode in [(result_f, 'forward'), (result_b, 'backward')]:
-                if result.mean != 0:
-                    rel_err = result.sdev / abs(result.mean)
-                    dw_cur = self.adaptive_widths[key][r_index][mode]
-                    if rel_err > 0.1:
-                        self.adaptive_widths[key][r_index][mode] = dw_cur * 2.0
-                    elif rel_err < 0.0001:
-                        self.adaptive_widths[key][r_index][mode] = dw_cur * 0.5
+            if self.adapt_width:
+                for result, mode in [(result_f, 'forward'), (result_b, 'backward')]:
+                    if result.mean != 0:
+                        rel_err = result.sdev / abs(result.mean)
+                        dw_cur = self.adaptive_widths[key][r_index][mode]
+                        if rel_err > self.max_rel_err:
+                            self.adaptive_widths[key][r_index][mode] = dw_cur * 2.0
+                        elif rel_err < self.min_rel_err:
+                            self.adaptive_widths[key][r_index][mode] = dw_cur * 0.5
 
             rate_contrib = result_b.mean - result_f.mean
             total_forward += result_f.mean
@@ -581,6 +632,7 @@ class BEST:
             for result, rname in [(result_f, 'forward'), (result_b, 'backward')]:
                 if result.mean != 0:
                     rel_err = result.sdev / abs(result.mean)
+                    self.error_stats.setdefault('rel_errs', []).append(rel_err)
                     if rel_err > 5.0 and self.world_rank == 0:
                         print(f"      Warning: Large Vegas error at "
                             f"r={r_target:.3f} for "
@@ -743,9 +795,10 @@ class BEST:
     # ------------------------------------------------------------------
     # Rate computation (Analytical, 2->2 only)
     # ------------------------------------------------------------------
-    def _compute_rates_all_species(self, process_name, n_F):
+    def _compute_rates_all_species(self, process_name, n_F, M_squared=None):
         config = self.process_configs[process_name]
-        M_squared = config['coupling'] ** 2
+        if M_squared is None:
+            M_squared = config['coupling'] ** 2
         input_species = config['input']
         output_species = config['output']
         species_rates = {}
@@ -815,7 +868,7 @@ class BEST:
         if active_processes is None:
             active_processes = list(self.process_configs.keys())
         t_step_start = time.time()
-        self.error_stats = {'dropped': 0, 'neglected': 0}
+        self.error_stats = {'dropped': 0, 'neglected': 0, 'rel_errs': []}
 
         if self.world_rank == 0:
             print(f"\n{'=' * 60}")
@@ -840,8 +893,8 @@ class BEST:
                 f = self.distributions_1d[species]
                 f_safe = np.maximum(f, 1e-30)
                 dlogf_max = np.max(np.abs(dt * k1[species] / f_safe))
-                if dlogf_max > 0.3:
-                    ratio = 0.3 / dlogf_max
+                if dlogf_max > self.max_rel_change:
+                    ratio = self.max_rel_change / dlogf_max
                     dt_actual = min(dt_actual,
                                     dt * 10**np.floor(np.log10(ratio)))
             if dt_actual < dt:
@@ -913,6 +966,9 @@ class BEST:
                   f"{self.error_stats['dropped']}")
             print(f"    Vegas errors - Neglected: "
                   f"{self.error_stats['neglected']}")
+            re = self.error_stats.get('rel_errs', [])
+            if re:
+                print(f"    Max rel_err: {np.max(re):.3e}")
             print(f"{'=' * 60}")
 
         return k1
@@ -946,8 +1002,8 @@ class BEST:
                 f = self.distributions_1d[species]
                 f_safe = np.maximum(f, 1e-30)
                 dlogf_max = np.max(np.abs(dt * k1[species] / f_safe))
-                if dlogf_max > 0.3:
-                    ratio = 0.3 / dlogf_max
+                if dlogf_max > self.max_rel_change:
+                    ratio = self.max_rel_change / dlogf_max
                     dt_actual = min(dt_actual,
                                     dt * 10**np.floor(np.log10(ratio)))
             if dt_actual < dt:
@@ -1141,10 +1197,10 @@ class BEST:
         else:
             state = None
         state = self.world_comm.bcast(state, root=0)
-        self.species_dof = state.get('species_dof', {s: 1 for s in self.species_list})
         self.species_config = state['species_config']
         self.species_mass = state.get('species_mass', {})
         self.species_list = list(self.species_config.keys())
+        self.species_dof = state.get('species_dof', {s: 1 for s in self.species_list})
         self.q_min = state['q_min']
         self.q_max = state['q_max']
         self.n_grid = state['n_grid']
@@ -1206,35 +1262,25 @@ Equations (A8)-(A18) with general masses m1, m2, m3, m4.
 # Angular integral kernels (general mass 2->2)
 # ======================================================================
 def _F_backward_single(p1, p3, p4, M_squared, masses):
-    """
-    Backward kinematic function F(p1, p3, p4) for 12->34.
-    
-    Energy conservation: E1 + E2 = E3 + E4, so E2 = E3 + E4 - E1.
-    Then p2 = sqrt(E2^2 - m2^2).
-    
-    masses = [m1, m2, m3, m4]
-    """
     m1, m2, m3, m4 = masses
-    
     E1 = np.sqrt(p1**2 + m1**2)
     E3 = np.sqrt(p3**2 + m3**2)
     E4 = np.sqrt(p4**2 + m4**2)
     E2 = E3 + E4 - E1
-    
     if E2 <= m2 or E2 <= 0:
         return 0.0
     p2 = np.sqrt(E2**2 - m2**2)
     if p2 <= 1e-30 or p1 <= 1e-30:
         return 0.0
-    
     Q = m1**2 - m2**2 + m3**2 + m4**2
     gamma = E3 * E4 - E1 * E3 - E1 * E4
     kappa = p1**2 + p3**2
 
+    M_is_callable = callable(M_squared)
+
     def integrand(cos_theta):
         sin_theta_sq = max(0.0, 1.0 - cos_theta**2)
         eps = p1 * p3 * cos_theta
-        
         a = p4**2 * (-4.0 * kappa + 8.0 * eps)
         if a >= 0:
             return 0.0
@@ -1243,7 +1289,12 @@ def _F_backward_single(p1, p3, p4, M_squared, masses):
         disc = b * b - 4.0 * a * c
         if disc < 0:
             return 0.0
-        return M_squared * np.pi / np.sqrt(-a)
+        if M_is_callable:
+            t = m1**2 + m3**2 - 2.0 * E1 * E3 + 2.0 * eps   # eps = p1*p3*cosθ
+            M_sq = M_squared(t)
+        else:
+            M_sq = M_squared
+        return M_sq * np.pi / np.sqrt(-a)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1255,33 +1306,40 @@ def _F_backward_single(p1, p3, p4, M_squared, masses):
 def _F_forward_single(p1, p2, p3, M_squared, masses):
     """
     Forward kinematic function F'(p1, p2, p3) for 12->34.
-    
+
     Energy conservation: E4 = E1 + E2 - E3.
     Then p4 = sqrt(E4^2 - m4^2).
-    
+
     masses = [m1, m2, m3, m4]
+
+    M_squared: constant |M|^2, or a callable M_squared(t) evaluated at
+    t = (p1 - p3)^2 = m1^2 + m3^2 - 2 E1 E3 + 2 p1 p3 cos(theta)
+    (valid for t-channel matrix elements independent of cos(alpha),
+    Ala-Mattinen et al. Eq. (A14), (A19)).
     """
     m1, m2, m3, m4 = masses
-    
+
     E1 = np.sqrt(p1**2 + m1**2)
     E2 = np.sqrt(p2**2 + m2**2)
     E3 = np.sqrt(p3**2 + m3**2)
     E4 = E1 + E2 - E3
-    
+
     if E4 <= m4 or E4 <= 0:
         return 0.0
     p4 = np.sqrt(E4**2 - m4**2)
     if p4 <= 1e-30 or p1 <= 1e-30:
         return 0.0
-    
+
     Q_prime = m1**2 - m4**2 + m2**2 + m3**2
     gamma_p = E1 * E2 - E1 * E3 - E2 * E3
     kappa_p = p1**2 + p3**2
 
+    M_is_callable = callable(M_squared)
+
     def integrand(cos_theta):
         sin_theta_sq = max(0.0, 1.0 - cos_theta**2)
         eps = p1 * p3 * cos_theta
-        
+
         a = p2**2 * (-4.0 * kappa_p + 8.0 * eps)
         if a >= 0:
             return 0.0
@@ -1290,7 +1348,12 @@ def _F_forward_single(p1, p2, p3, M_squared, masses):
         disc = b * b - 4.0 * a * c
         if disc < 0:
             return 0.0
-        return M_squared * np.pi / np.sqrt(-a)
+        if M_is_callable:
+            t = m1**2 + m3**2 - 2.0 * E1 * E3 + 2.0 * eps
+            M_sq = M_squared(t)
+        else:
+            M_sq = M_squared
+        return M_sq * np.pi / np.sqrt(-a)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
