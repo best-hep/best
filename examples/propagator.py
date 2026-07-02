@@ -135,4 +135,4 @@ for step in range(n_steps):
         N0, E0 = history['phi']['n'][0], history['phi']['e'][0]
         print(f"  N/N0 = {m['phi']['n'] / N0:.6f}   "
               f"E/E0 = {m['phi']['e'] / E0:.6f}")
-        solver.save_checkpoint('checkpoint.pkl', history=history)
+    solver.save_checkpoint('checkpoint.pkl', history=history)
