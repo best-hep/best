@@ -14,6 +14,7 @@ Key features:
 - **Massive particles** — Arbitrary masses, including time-dependent masses for phase transitions
 - **Multiple coupled species** — Simultaneous evolution of several interacting species
 - **Cosmological expansion** — Comoving momenta with built-in radiation domination
+- **Exponential time integrator (`exprb`)** — Hubble-paced time steps for expansion runs to freeze-out, where explicit steppers become impractically expensive (see *Choosing a time integrator*)
 - **Semi-analytical 2→2 benchmark** — Exact energy conservation following [Ala-Mattinen et al. (2022)](https://arxiv.org/abs/2201.06456)
 - **MPI parallelization** — Near-linear scaling to hundreds of cores
 
@@ -34,14 +35,20 @@ vegas
 ```
 ## Repository Structure
 ```
-besthep.py          # Main solver
+besthep.py            # Main solver
+dof_Drees_etal.dat    # SM relativistic degrees of freedom table (Drees et al.)
 examples/
-  2to2m1.py         # 2→2 massive thermalization
-  2to3m1.py         # 2→3 cannibal process
-  propagator.py     # momentum-dependent matrix element (s-/t-channel)
+  2to2m1.py           # 2→2 massive thermalization
+  2to3m1.py           # 2→3 cannibal process
+  propagator.py       # momentum-dependent matrix element (s-/t-channel)
+  subthreshold_freezeout.py  # sub-threshold freeze-out to relic abundance
+                             # (dof-table cosmology, method='exprb')
 scripts/
-  plot.py           # Plot evolution from checkpoint
-  compare_rates.py  # Vegas vs analytical benchmark
+  plot.py             # Plot evolution from checkpoint
+  compare_rates.py    # Vegas vs analytical benchmark
+  plot_spectra_stfo.py  # f(q) snapshots + BE overlay for the freeze-out run
+                        # (fits T from its prescribed bath species)
+  plot_yield_stfo.py    # Y = n/s vs x = m1/T, with H vs net-rate panel
 requirements.txt
 LICENSE
 ```
@@ -127,7 +134,7 @@ for step in range(n_steps):
 Run with MPI:
 
 ```bash
-mpirun -np 8 python3 main.py
+mpirun -np 4 python3 examples/2to2m1.py
 ```
 ### 2→3 number-changing process
 
@@ -144,6 +151,22 @@ The identical-particle decomposition (*C* = 2*C*₂ + 3*C*₃) is handled automa
 ```python
 solver.current_time = 100.0
 solver.set_radiation_dominated(a0=1.0, t0=solver.current_time)
+```
+
+### Choosing a time integrator
+
+- `heun` (default) and `euler` are explicit: adequate for short relaxation /
+  thermalization problems.
+- `exprb` (diagonal exponential Rosenbrock–Euler): **use this for expansion
+  runs that track equilibrium over many Hubble times (e.g. freeze-out to a
+  relic abundance).** There the collision rates exceed *H* by orders of
+  magnitude, so explicit steppers need dt ~ 1/rate and become impractically
+  expensive, while `exprb` runs Hubble-paced dt at one Vegas pass per step.
+  First order, positivity-preserving; it does not remove elastic
+  shape-relaxation stiffness.
+
+```python
+solver.evolve_step(dt, method='exprb')
 ```
 
 ### Multiple species
@@ -169,6 +192,12 @@ solver.save_checkpoint('checkpoint.pkl', history=history)
 history = solver.load_checkpoint('checkpoint.pkl',
     matrix_elements={'matrix_element': matrix_element})
 ```
+
+`save_checkpoint` is **collective**: call it from all MPI ranks (as in the
+examples above). The checkpoint stores the adapted Vegas integrator state of
+every MPI group, so resumed runs continue seamlessly; resuming with a
+different number of momentum groups discards the integrator maps with a
+warning and re-adapts.
 
 ## Citation
 
@@ -201,4 +230,3 @@ J.~H.~Yoon,
 ## License
 
 MIT
-
