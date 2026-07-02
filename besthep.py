@@ -10,7 +10,19 @@ Usage:
     solver.initialize_species('phi', my_init_func, stat='boson', mass=1.0)
     solver.add_process('my_process', ['phi','phi'], ['phi','phi','phi'],
                        my_matrix_element, coupling=1.0, neval=1e6)
-    solver.evolve_step(dt=1.0)
+    solver.evolve_step(dt=1.0, method='exprb')   # exponential Rosenbrock-Euler
+
+Time-stepping methods (evolve_step, method=...):
+    'euler' : explicit log-space Euler.
+    'heun'  : explicit 2-stage predictor-corrector (2 Vegas passes/step).
+    'exprb'   : diagonal (W-type) exponential Rosenbrock-Euler. 1 Vegas pass/step
+              (like euler). Positivity-preserving; the per-mode (diagonal)
+              relaxation is integrated exactly, so the per-mode rates do not
+              limit dt (off-diagonal mode coupling still can). First order with
+              the inexact diagonal Jacobian. Refs: Hochbruck, Ostermann &
+              Schweitzer (2009), SIAM J. Numer. Anal. 47(1) 786-803; Hochbruck
+              & Ostermann (2010), Acta Numerica 19, 209-286, eq. (2.47). W-type
+              (inexact Jacobian): Hairer & Wanner II, IV.7.
 """
 import numpy as np
 from mpi4py import MPI
@@ -53,8 +65,15 @@ class ExtrapolatingInterp:
         n_high = max(10, len(r_grid) // 10)
         self.b_high, self.a_high = np.polyfit(E_grid[-n_high:], y[-n_high:], 1)
 
+        # interpolate on the same axis as the grid scale (auto-detected):
+        # log-spaced grid -> log(r) axis; linear grid -> r axis (unchanged).
+        lr = np.log(r_grid)
+        self._log_axis = (np.all(r_grid > 0)
+                          and np.allclose(np.diff(lr), np.diff(lr).mean(),
+                                          rtol=1e-2, atol=1e-12))
+        x_grid = lr if self._log_axis else r_grid
         kind = 'cubic' if len(r_grid) >= 4 else 'linear'
-        self._interp = interp1d(r_grid, f, kind=kind, bounds_error=False,
+        self._interp = interp1d(x_grid, f, kind=kind, bounds_error=False,
                                 fill_value=(f[0], f[-1]))
         self.q_min = r_grid[0]
         self.q_max = r_grid[-1]
@@ -71,6 +90,9 @@ class ExtrapolatingInterp:
         # boson
         return np.where(y > 0, 1.0 / (np.exp(y) - 1.0 + 1e-30), 0.0)
 
+    def _xq(self, p):
+        """Map a query momentum to the interpolation axis (log if log-spaced)."""
+        return np.log(p) if self._log_axis else p
 
     def __call__(self, p):
         if isinstance(p, (int, float)):
@@ -83,7 +105,7 @@ class ExtrapolatingInterp:
                 y = self.a_high + self.b_high * E
                 return max(0.0, float(self._f_from_y(np.array([y]))[0]))
             else:
-                return float(self._interp(p))
+                return float(self._interp(self._xq(p)))
 
         p = np.atleast_1d(np.asarray(p, dtype=float))
         result = np.empty_like(p)
@@ -93,7 +115,7 @@ class ExtrapolatingInterp:
         mask_mid = ~mask_low & ~mask_high
 
         if np.any(mask_mid):
-            result[mask_mid] = self._interp(p[mask_mid])
+            result[mask_mid] = self._interp(self._xq(p[mask_mid]))
         if np.any(mask_low):
             E_low = self._energy(p[mask_low])
             y = self.a_low + self.b_low * E_low
@@ -123,6 +145,72 @@ def heun_update(f_orig, k1, k2, dt, f_pred=None):
     log_f = np.log(f0)
     log_f += dt * 0.5 * (k1 / f0 + k2 / fp)
     return np.exp(log_f)
+
+
+def exprb_update(f, A, Gamma, dt):
+    """Diagonal exponential Rosenbrock-Euler step for one species.
+
+        f_new = f*exp(-Gamma*dt) + A*dt*phi1(-Gamma*dt),   phi1(z) = (e^z-1)/z
+
+    Equivalent to f + dt*phi1(-Gamma*dt)*(A - Gamma*f). Because A >= 0, both terms
+    are >= 0 for ANY sign of Gamma, so f_new >= 0 whenever f >= 0 -- no clamp on
+    Gamma, no floor on f_new. Reduces to forward Euler as Gamma->0 (phi1(0)=1) and
+    preserves equilibria (A - Gamma*f = 0 => f_new = f). expm1 keeps phi1 accurate
+    for small z; the z=0 removable singularity uses a short Taylor branch.
+
+    Unit-tested (pure numpy): exact (machine precision) for frozen-coefficient
+    scalar linear problems, positive for both signs of Gamma; first order under
+    the diagonal-Jacobian approximation (error scales with the neglected
+    off-diagonal coupling). Refs: Hochbruck, Ostermann & Schweitzer (2009);
+    Hochbruck & Ostermann (2010), Acta Numerica 19, eq. (2.47); diagonal/W-type
+    approximation: Hairer & Wanner II, IV.7."""
+    f = np.asarray(f, float); A = np.asarray(A, float); Gamma = np.asarray(Gamma, float)
+    z = -Gamma * dt
+    small = np.abs(z) < 1e-10
+    zz = np.where(small, 1.0, z)                       # avoid 0/0 in the safe branch
+    phi1 = np.where(small, 1.0 + z * (0.5 + z / 6.0), np.expm1(zz) / zz)
+    return f * np.exp(z) + A * dt * phi1
+
+
+def assemble_A_Gamma(f, gain, loss, stat):
+    """Per-mode (A, Gamma) for exprb_update from the OBSERVED-mode gain and loss.
+
+        C(p) = gain - loss = G0*(1+eta*f) - L0*f = A - Gamma*f
+        A     = gain / (1 + eta*f)        (= G0 >= 0, production rate)
+        Gamma = loss / f - eta*A          (= L0 - eta*G0 = -dC/df, diagonal Jac)
+
+    eta = +1 boson, -1 fermion, 0 Maxwell-Boltzmann. gain, loss are clipped to
+    >= 0 against MC-noise excursions (the true integrands are positive); this only
+    enforces the known sign of the rates and guarantees A >= 0 (hence positivity).
+    By construction A - Gamma*f == gain - loss == net rate; evolve_step asserts
+    this equals k1 to catch any per-slot mis-assignment upstream."""
+    eta = 1.0 if stat == 'boson' else (-1.0 if stat == 'fermion' else 0.0)
+    gain = np.maximum(np.asarray(gain, float), 0.0)
+    loss = np.maximum(np.asarray(loss, float), 0.0)
+    f = np.asarray(f, float)
+    f_safe = np.maximum(f, 1e-300)
+    A = gain / (1.0 + eta * f)
+    Gamma = loss / f_safe - eta * A
+    return A, Gamma
+
+
+def _merge_group_states(gathered):
+    """Merge per-group (color) vegas integrators and adaptive widths gathered
+    from the group leaders into single dicts for checkpointing.
+
+    Inner keys are disjoint by construction -- integrator keys carry the color
+    (f"{color}_{mode}") and width keys are GLOBAL grid indices partitioned into
+    per-group blocks -- so a plain union is exact."""
+    integ, widths = {}, {}
+    for item in gathered or []:
+        if item is None:
+            continue
+        _color, gi, gw = item
+        for proc_key, d in gi.items():
+            integ.setdefault(proc_key, {}).update(d)
+        for wkey, d in gw.items():
+            widths.setdefault(wkey, {}).update(d)
+    return integ, widths
 
 
 # ======================================================================
@@ -159,9 +247,10 @@ class BEST:
             to process sequentially).
         max_rel_change : float
             Adaptive time-step control: the step is reduced so that the
-            maximum relative change of f per step, max_p |dt C[f]/f|,
-            stays below this value. Smaller values improve accuracy at
-            the cost of more steps.
+            maximum relative change of f per step stays below this value.
+            For euler/heun this is max_p |dt C[f]/f|; for 'exprb' it is the
+            phi1-damped realized change max_p |dt phi1(-Gamma dt) C[f]/f|,
+            so the stiff linear part no longer throttles dt.
         adapt_width : bool
             If True, the Gaussian energy-conservation width is adapted
             per grid point from the Monte Carlo relative error (rel_err):
@@ -363,9 +452,10 @@ class BEST:
                 domain.extend([
                     [self.q_min, self.q_max], [0, np.pi], [0, 2 * np.pi]
                 ])
-            if self.world_rank == 0:
-                print(f"  Creating Vegas integrator for {proc_key} ({mode}): "
-                      f"{len(domain)} dimensions", flush=True)
+            if self.sub_rank == 0 and self.world_rank == 0:
+                print(f"  Creating Vegas integrator for {proc_key} ({mode}) "
+                      f"[group {self.color}]: {len(domain)} dimensions",
+                      flush=True)
             self.vegas_integrators[proc_key][key] = \
                 self._vegas.Integrator(domain, mpi=True)
         return self.vegas_integrators[proc_key][key]
@@ -431,6 +521,13 @@ class BEST:
         vegas_mod = self._vegas
         a = self.scale_factor(t)
         masses = [self.species_mass.get(s, 0.0) for s in all_species]
+        # partner-leg internal dof (every leg except the observed/target one);
+        # the target's own g is applied at the moment level in compute_moments.
+        _dof = getattr(self, 'species_dof', {})
+        g_factor = 1.0
+        for _l in range(n_total):
+            if _l != target_idx:
+                g_factor *= _dof.get(all_species[_l], 1)
 
 
         @vegas_mod.lbatchintegrand
@@ -503,7 +600,7 @@ class BEST:
             prod_2E = np.ones(N)
             for k in range(n_total):
                 prod_2E *= 2.0 * energies[k]
-            phase = jacobian / (prod_2E * pi_power)
+            phase = g_factor * jacobian / (prod_2E * pi_power)
 
             # Distribution functions
             f_arr = []
@@ -570,7 +667,7 @@ class BEST:
             self.error_stats = {'dropped': 0, 'neglected': 0, 'rel_errs': []}
         if not hasattr(self, 'adaptive_widths'):
             self.adaptive_widths = {}
-        
+
         total_rate = 0.0
         total_forward = 0.0
         total_backward = 0.0
@@ -625,10 +722,13 @@ class BEST:
                         elif rel_err < self.min_rel_err:
                             self.adaptive_widths[key][r_index][mode] = dw_cur * 0.5
 
-            rate_contrib = result_b.mean - result_f.mean
-            total_forward += result_f.mean
-            total_backward += result_b.mean
-
+            # rel_err bookkeeping + drop decision. IMPORTANT: a dropped (noisy)
+            # contribution must add 0 to ALL of rate, forward, backward together,
+            # so that gain-loss == rate is preserved (the 'exprb' path builds
+            # gain/loss from forward/backward and asserts A-Gamma*f == k1). A
+            # dropped mode then has gain=loss=0 -> A=Gamma=0 -> exprb leaves it put,
+            # matching euler/heun (k1=0 => no move).
+            drop = False
             for result, rname in [(result_f, 'forward'), (result_b, 'backward')]:
                 if result.mean != 0:
                     rel_err = result.sdev / abs(result.mean)
@@ -640,11 +740,15 @@ class BEST:
                             f"rel_err={rel_err:.2f}")
                     if rel_err > 1.0:
                         self.error_stats['dropped'] += 1
-                        rate_contrib = 0.0
+                        drop = True   # TODO(optional): retry at higher neval
                 else:
                     self.error_stats['neglected'] += 1
 
-            total_rate += rate_contrib
+            if not drop:
+                total_rate     += result_b.mean - result_f.mean
+                total_forward  += result_f.mean
+                total_backward += result_b.mean
+
         return total_rate, total_forward, total_backward
 
     # ------------------------------------------------------------------
@@ -653,8 +757,12 @@ class BEST:
     def _compute_rates_single_pass(self, active_processes, t=0.0,
                                     species_filter=None):
         """Compute rates for a single target side configuration.
-        
+
         species_filter: if provided, only compute for these species.
+        Returns (species_rates, species_forward, species_backward) where
+        forward/backward are the signed reaction-direction rates (sign folded
+        in via the integrand). _compute_rates_vegas turns these into physical
+        per-slot gain/loss.
         """
         for s, func in self.species_mass_func.items():
             self.species_mass[s] = func(t)
@@ -725,72 +833,101 @@ class BEST:
         return species_rates, species_forward, species_backward
 
     def _compute_rates_vegas(self, active_processes, t=0.0):
-            """Compute collision rates with slot summation for n_in != n_out.
+        """Compute collision rates with slot summation for n_in != n_out.
 
-            For each process and each species, counts how many times the
-            species appears on input vs output side. If counts differ,
-            computes C_in and C_out separately and combines:
-                C_total = n_in_s * C_in + n_out_s * C_out
-            If counts are equal, computes once and multiplies by
-                (n_in_s + n_out_s).
-            """
-            # Update masses at time t
-            for s, func in self.species_mass_func.items():
-                self.species_mass[s] = func(t)
+        Returns (species_rates, species_forward, species_backward) -- the
+        ORIGINAL signature, UNCHANGED. forward/backward are the signed
+        reaction-direction FW/BW sums (as before); note forward==loss and
+        backward==gain ONLY when the target is input-side. Do not read physical
+        gain/loss off these for a species that also appears on the output side.
 
-            species_rates = {sp: np.zeros_like(self.r_grids[sp])
+        SIDE EFFECT (used only by the 'exprb' step): this method also stores the
+        PHYSICAL production/destruction coefficients of the observed mode,
+        aligned PER SLOT, on self.gain_rates / self.loss_rates, so that
+        gain - loss == rates holds identically even when the target sits on the
+        OUTPUT side (e.g. cannibal phi phi <-> phi phi phi). On the '_out' slot
+        the reaction-direction BW/FW roles FLIP relative to gain/loss, and the
+        per-pass kf,kb already carry sign=-1, which is undone:
+            input-side slot : gain = BW (=kb),   loss = FW (=kf)
+            output-side slot: gain = FW (=-kf),  loss = BW (=-kb)
+        (Deriving the diagonal Jacobian from the summed forward/backward instead
+        of per slot is WRONG for the output side -- it mixes the (1+eta f) and f
+        powers and cannot be un-mixed.)
+        """
+        # Update masses at time t
+        for s, func in self.species_mass_func.items():
+            self.species_mass[s] = func(t)
+
+        species_rates = {sp: np.zeros_like(self.r_grids[sp])
+                         for sp in self.species_list}
+        # original signed FW/BW sums (returned, backward-compatible)
+        species_forward = {sp: np.zeros_like(self.r_grids[sp])
+                           for sp in self.species_list}
+        species_backward = {sp: np.zeros_like(self.r_grids[sp])
                             for sp in self.species_list}
-            species_forward = {sp: np.zeros_like(self.r_grids[sp]) for sp in self.species_list}
-            species_backward = {sp: np.zeros_like(self.r_grids[sp]) for sp in self.species_list}
+        # physical per-slot-aligned gain/loss (stored on self, for 'exprb')
+        species_gain = {sp: np.zeros_like(self.r_grids[sp])
+                        for sp in self.species_list}
+        species_loss = {sp: np.zeros_like(self.r_grids[sp])
+                        for sp in self.species_list}
 
-            for process_name in active_processes:
-                config = self.process_configs[process_name]
-                input_species = config['input']
-                output_species = config['output']
+        for process_name in active_processes:
+            config = self.process_configs[process_name]
+            input_species = config['input']
+            output_species = config['output']
 
-                for species in self.species_list:
-                    n_in_s = input_species.count(species)
-                    n_out_s = output_species.count(species)
+            for species in self.species_list:
+                n_in_s = input_species.count(species)
+                n_out_s = output_species.count(species)
 
-                    if n_in_s == 0 and n_out_s == 0:
-                        continue
+                if n_in_s == 0 and n_out_s == 0:
+                    continue
 
-                    symmetric = sorted(input_species) == sorted(output_species)
- 
-                    if n_in_s == n_out_s and symmetric:
-                        # Symmetric process: C_in = C_out by relabeling.
-                        # Compute once, multiply by n_in_s.
-                        self._force_target_side = None
-                        k, kf, kb = self._compute_rates_single_pass(
+                symmetric = sorted(input_species) == sorted(output_species)
+
+                if n_in_s == n_out_s and symmetric:
+                    # Symmetric process: C_in = C_out by relabeling. Compute once
+                    # (target auto-placed on the input side, sign=+1), multiply by
+                    # n_in_s. Input-side alignment: BW=gain, FW=loss.
+                    self._force_target_side = None
+                    k, kf, kb = self._compute_rates_single_pass(
+                        [process_name], t=t, species_filter=[species])
+                    species_rates[species]    += n_in_s * k[species]
+                    species_forward[species]  += n_in_s * kf[species]   # original semantics
+                    species_backward[species] += n_in_s * kb[species]
+                    species_gain[species]     += n_in_s * kb[species]   # input: BW=gain
+                    species_loss[species]     += n_in_s * kf[species]   #        FW=loss
+                else:
+                    # Asymmetric OR n_in_s != n_out_s: compute each side present.
+                    if n_in_s > 0:
+                        self._integrator_suffix = '_in'
+                        self._force_target_side = 'input'
+                        k_in, kf_in, kb_in = self._compute_rates_single_pass(
                             [process_name], t=t, species_filter=[species])
-                        species_rates[species] += n_in_s * k[species]
-                        species_forward[species] += n_in_s * kf[species]
-                        species_backward[species] += n_in_s * kb[species] 
-                    else:
-                        # Asymmetric process OR n_in_s != n_out_s:
-                        # C_in != C_out, must compute both sides separately.
-                        if n_in_s > 0:
-                            self._integrator_suffix = '_in'
-                            self._force_target_side = 'input'
-                            k_in, kf_in, kb_in = self._compute_rates_single_pass(
-                                [process_name], t=t, species_filter=[species])
-                            species_rates[species] += n_in_s * k_in[species]
-                            species_forward[species] += n_in_s * kf_in[species]
-                            species_backward[species] += n_in_s * kb_in[species]
-                        if n_out_s > 0:
-                            self._integrator_suffix = '_out'
-                            self._force_target_side = 'output'
-                            k_out, kf_out, kb_out = self._compute_rates_single_pass(
-                                [process_name], t=t, species_filter=[species])
-                            species_rates[species] += n_out_s * k_out[species]
-                            species_forward[species] += n_out_s * kf_out[species]
-                            species_backward[species] += n_out_s * kb_out[species]
- 
-                        self._force_target_side = None
-                        self._integrator_suffix = ''
+                        species_rates[species]    += n_in_s * k_in[species]
+                        species_forward[species]  += n_in_s * kf_in[species]
+                        species_backward[species] += n_in_s * kb_in[species]
+                        species_gain[species]     += n_in_s * kb_in[species]  # input: BW=gain
+                        species_loss[species]     += n_in_s * kf_in[species]  #        FW=loss
+                    if n_out_s > 0:
+                        self._integrator_suffix = '_out'
+                        self._force_target_side = 'output'
+                        k_out, kf_out, kb_out = self._compute_rates_single_pass(
+                            [process_name], t=t, species_filter=[species])
+                        species_rates[species]    += n_out_s * k_out[species]
+                        species_forward[species]  += n_out_s * kf_out[species]   # original semantics
+                        species_backward[species] += n_out_s * kb_out[species]
+                        # output-side: roles FLIP; sign=-1 folded in kf_out,kb_out -> undo
+                        species_gain[species]     += n_out_s * (-kf_out[species])  # FW_out=gain
+                        species_loss[species]     += n_out_s * (-kb_out[species])  # BW_out=loss
 
-            return species_rates, species_forward, species_backward
+                    self._force_target_side = None
+                    self._integrator_suffix = ''
 
+        # gain/loss exposed only via self (does NOT change the return signature)
+        self.gain_rates = species_gain
+        self.loss_rates = species_loss
+        return species_rates, species_forward, species_backward
 
     # ------------------------------------------------------------------
     # Rate computation (Analytical, 2->2 only)
@@ -881,10 +1018,40 @@ class BEST:
             self.distributions_1d, root=0)
         self.interpolators = self.world_comm.bcast(self.interpolators, root=0)
 
-        # k1
-        k1, k1_fwd, k1_bwd = self._compute_rates_vegas(active_processes, t=self.current_time)
-        self.forward_rates = k1_fwd
-        self.backward_rates = k1_bwd
+        # k1 = net rates (original 3-tuple return, unchanged). The per-slot
+        # aligned gain/loss for the 'exprb' path are read from self.gain_rates /
+        # self.loss_rates (set as a side effect of _compute_rates_vegas).
+        k1, _fwd, _bwd = self._compute_rates_vegas(
+            active_processes, t=self.current_time)
+
+        # Assemble (A, Gamma) for exponential Rosenbrock-Euler and VERIFY the
+        # per-slot gain/loss alignment. A - Gamma*f must reproduce the net rate
+        # k1; if not, the slot assignment in _compute_rates_vegas is wrong (not
+        # the integrator). MPI-safe: rank 0 builds an error MESSAGE (or None) and
+        # broadcasts it, so ALL ranks raise together (raising on rank 0 alone
+        # would hang the others at the next collective).
+        A_dict, Gamma_dict = {}, {}
+        if method == 'exprb':
+            exprb_err = None
+            if self.world_rank == 0:
+                for species in self.species_list:
+                    stat = self.species_config.get(species, 'boson')
+                    A_dict[species], Gamma_dict[species] = assemble_A_Gamma(
+                        self.distributions_1d[species], self.gain_rates[species],
+                        self.loss_rates[species], stat)
+                    net = (A_dict[species]
+                           - Gamma_dict[species] * self.distributions_1d[species])
+                    if not np.allclose(net, k1[species], rtol=1e-6, atol=1e-30):
+                        bad = float(np.max(np.abs(net - k1[species])))
+                        exprb_err = (
+                            f"exprb slot alignment broken for '{species}': "
+                            f"A-Gamma*f != k1 (max diff {bad:.3e}). The per-slot "
+                            f"gain/loss assignment in _compute_rates_vegas is "
+                            f"wrong, not the integrator.")
+                        break
+            exprb_err = self.world_comm.bcast(exprb_err, root=0)
+            if exprb_err is not None:
+                raise AssertionError(exprb_err)
 
         # Adaptive dt
         dt_actual = dt
@@ -892,7 +1059,18 @@ class BEST:
             for species in self.species_list:
                 f = self.distributions_1d[species]
                 f_safe = np.maximum(f, 1e-30)
-                dlogf_max = np.max(np.abs(dt * k1[species] / f_safe))
+                if method == 'exprb':
+                    # limit the REALIZED (phi1-damped) change, not the explicit
+                    # one -> the stiff linear part no longer throttles dt
+                    z = -Gamma_dict[species] * dt
+                    small = np.abs(z) < 1e-10
+                    zz = np.where(small, 1.0, z)
+                    phi1 = np.where(small, 1.0 + z * (0.5 + z / 6.0),
+                                    np.expm1(zz) / zz)
+                    change = dt * phi1 * k1[species] / f_safe
+                else:
+                    change = dt * k1[species] / f_safe
+                dlogf_max = np.max(np.abs(change))
                 if dlogf_max > self.max_rel_change:
                     ratio = self.max_rel_change / dlogf_max
                     dt_actual = min(dt_actual,
@@ -940,13 +1118,31 @@ class BEST:
             for species in self.species_list:
                 f_predictor[species] = self.distributions_1d[species].copy()
 
-            k2, _, _ = self._compute_rates_vegas(active_processes, t=self.current_time + dt_actual)
+            k2, _, _ = self._compute_rates_vegas(
+                active_processes, t=self.current_time + dt_actual)
 
             if self.world_rank == 0:
                 for species in self.species_list:
                     self.distributions_1d[species] = heun_update(
                         f_original[species], k1[species], k2[species],
                         dt_actual, f_pred=f_predictor[species])
+                    self.interpolators[species] = ExtrapolatingInterp(
+                self.r_grids[species], self.distributions_1d[species],
+                mass=self.species_mass.get(species, 0.0),
+                stat=self.species_config.get(species, 'boson'))
+
+        elif method == 'exprb':
+            # Exponential Rosenbrock-Euler (1-stage, diagonal / W-type).
+            #   f_new = f*exp(-Gamma*dt) + A*dt*phi1(-Gamma*dt)
+            # A, Gamma were assembled + verified (A-Gamma*f == k1) above from the
+            # per-slot gain/loss. Single-stage: NO extra Vegas call (like euler).
+            # No clamp, no floor -- positivity is structural (A>=0, any sign of
+            # Gamma). Dropped/noisy modes have gain=loss=0 -> A=Gamma=0 -> held.
+            if self.world_rank == 0:
+                for species in self.species_list:
+                    self.distributions_1d[species] = exprb_update(
+                        self.distributions_1d[species],
+                        A_dict[species], Gamma_dict[species], dt_actual)
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
@@ -1078,11 +1274,11 @@ class BEST:
     # ------------------------------------------------------------------
     def init_history(self):
         """Initialize history dict for all registered species.
- 
+
         Returns a dict with keys 'times' and one sub-dict per species,
         each containing lists for 'f', 'n', 'e'.
         The initial state (t = current_time) is recorded automatically.
- 
+
         Usage:
             history = solver.init_history()
         """
@@ -1098,15 +1294,15 @@ class BEST:
         history['a'].append(self.scale_factor(self.current_time))
         history['times'].append(self.current_time)
         return history
- 
+
     def record(self, history):
         """Record current state into history for all species.
- 
+
         Appends distribution, number density, and energy density
         for every species in self.species_list, plus the current time.
         Returns the moments dict so callers can print diagnostics
         without calling compute_moments() again.
- 
+
         Usage:
             m = solver.record(history)
             print(f"E = {m['phi']['e']}")
@@ -1131,11 +1327,11 @@ class BEST:
     def compute_moments(self):
         """Compute comoving number and energy densities.
 
-        n = g ∫ d³q/(2π)³ f(q)                      ∝ a³ n_phys
-        e = g ∫ d³q/(2π)³ f(q) √(q²+a²m²)           ∝ a⁴ ρ_phys
+        n = g int d^3q/(2pi)^3 f(q)                     ~ a^3 n_phys
+        e = g int d^3q/(2pi)^3 f(q) sqrt(q^2+a^2 m^2)   ~ a^4 rho_phys
 
         where g = species_dof (internal degrees of freedom).
-        d³q = 4π q² dq after angular integration.
+        d^3q = 4pi q^2 dq after angular integration.
         For H=0 (a=1), these reduce to physical quantities.
         """
         moments = {}
@@ -1148,7 +1344,7 @@ class BEST:
             m = self.species_mass.get(species, 0.0)
             g = self.species_dof.get(species, 1)
             E_grid = np.sqrt(r_grid**2 + a**2 * m**2)
-            norm = g / (2 * np.pi)**3 * 4 * np.pi  # = g / (2π²)
+            norm = g / (2 * np.pi)**3 * 4 * np.pi  # = g / (2 pi^2)
             n = np.trapezoid(f * r_grid**2, r_grid) * norm
             e = np.trapezoid(f * r_grid**2 * E_grid, r_grid) * norm
             moments[species] = {'n': n, 'e': e}
@@ -1158,8 +1354,23 @@ class BEST:
     # Checkpoint save/load
     # ------------------------------------------------------------------
     def save_checkpoint(self, filename, history=None):
+        """Save solver state. COLLECTIVE: must be called by ALL ranks together
+        (the run scripts already do; only rank 0 writes the file).
+
+        vegas integrators and adaptive widths are PER-GROUP (color) state: each
+        group only ever holds its own color's integrators and its own r-block's
+        widths. Saving only rank 0's copies (the old behavior) stored color 0's
+        slice alone, so after EVERY resume all other groups silently restarted
+        with fresh, unadapted integrators and default widths -- on the frozen-out
+        plateau those produce spurious rates that erode f. Fix: gather each
+        group leader's dicts to rank 0 and merge before pickling."""
+        contrib = None
+        if self.sub_rank == 0:
+            contrib = (self.color, self.vegas_integrators, self.adaptive_widths)
+        gathered = self.world_comm.gather(contrib, root=0)
         if self.world_rank != 0:
             return
+        integ_all, widths_all = _merge_group_states(gathered)
         process_configs_ser = {}
         for name, config in self.process_configs.items():
             cc = config.copy()
@@ -1178,8 +1389,9 @@ class BEST:
             'step_count': self.step_count,
             'process_configs': process_configs_ser,
             'history': history,
-            'vegas_integrators': self.vegas_integrators,
-            'adaptive_widths': self.adaptive_widths,
+            'vegas_integrators': integ_all,
+            'adaptive_widths': widths_all,
+            'n_r_parallel': self.n_r_parallel,
         }
         dirname = os.path.dirname(filename)
         if dirname:
@@ -1210,6 +1422,21 @@ class BEST:
         self.step_count = state['step_count']
         self.vegas_integrators = state.get('vegas_integrators', {})
         self.adaptive_widths = state.get('adaptive_widths', {})
+        # Integrator maps are keyed by color and were adapted on that color's
+        # r-block. If the group partition changed (different n_r_parallel), the
+        # restored maps do not correspond to this run's momentum blocks: discard
+        # them LOUDLY (fresh adaptation, visible) rather than silently reusing
+        # maps adapted for other momenta. Widths are keyed by GLOBAL r_index and
+        # remain valid under any partition -> kept. Old checkpoints without
+        # 'n_r_parallel' are kept as-is (pre-fix behavior, backward compatible).
+        saved_groups = state.get('n_r_parallel')
+        if saved_groups is not None and saved_groups != self.n_r_parallel:
+            if self.world_rank == 0:
+                print(f"  WARNING: checkpoint written with {saved_groups} r-groups, "
+                      f"this run uses {self.n_r_parallel}: restored vegas "
+                      f"integrators do not match this partition -> discarding "
+                      f"them (integrators will re-adapt from scratch).")
+            self.vegas_integrators = {}
 
         # Lookup for matrix element restoration:
         # 1) user-provided dict, 2) caller's globals, 3) best.py globals
@@ -1290,7 +1517,7 @@ def _F_backward_single(p1, p3, p4, M_squared, masses):
         if disc < 0:
             return 0.0
         if M_is_callable:
-            t = m1**2 + m3**2 - 2.0 * E1 * E3 + 2.0 * eps   # eps = p1*p3*cosθ
+            t = m1**2 + m3**2 - 2.0 * E1 * E3 + 2.0 * eps   # eps = p1*p3*cos(theta)
             M_sq = M_squared(t)
         else:
             M_sq = M_squared
@@ -1367,7 +1594,7 @@ def _F_forward_single(p1, p2, p3, M_squared, masses):
 # ======================================================================
 class CollisionIntegral2to2Analytical:
     """Analytical 2->2 collision integral with exact energy conservation.
-    
+
     Supports general masses m1, m2, m3, m4.
     For identical particles (e.g. phi phi -> phi phi), pass masses=[m,m,m,m].
     """
@@ -1396,10 +1623,10 @@ class CollisionIntegral2to2Analytical:
         p1_key = round(p1, 10)
         if p1_key in self._F_BW:
             return self._F_BW[p1_key]
-        
+
         m1, m2, m3, m4 = self.masses
         E1 = np.sqrt(p1**2 + m1**2)
-        
+
         # Integration variables: (p3, p2) on grid
         # p4 determined by energy conservation: E4 = E1 + E2 - E3
         # But we want F(p1, p3, p4), integrating over (p3, p4)
@@ -1426,9 +1653,9 @@ class CollisionIntegral2to2Analytical:
         p1_key = round(p1, 10)
         if p1_key in self._F_FW:
             return self._F_FW[p1_key]
-        
+
         m1, m2, m3, m4 = self.masses
-        
+
         F = np.zeros((self.n_F, self.n_F))
         for i, p2 in enumerate(self.p_grid):
             for j, p3 in enumerate(self.p_grid):
@@ -1450,7 +1677,7 @@ class CollisionIntegral2to2Analytical:
         if p1 < 1e-30:
             return 0.0
         F_table = self._ensure_F_backward(p1)
-        
+
         m1, m2, m3, m4 = self.masses
         E1 = np.sqrt(p1**2 + m1**2)
         f1 = float(f_interp(p1))
@@ -1468,13 +1695,13 @@ class CollisionIntegral2to2Analytical:
                 if E2 <= m2 or E2 <= 0:
                     continue
                 p2 = np.sqrt(E2**2 - m2**2)
-                
+
                 f3 = float(f_interp(p3))
                 f4 = float(f_interp(p4))
                 f2 = float(f_interp(p2))
                 stat_f2 = ((1.0 + f2) if species_stat == 'boson'
                            else (1.0 - f2))
-                
+
                 # Phase space: p3^2/(2E3) * p4^2/(2E4) * dp3 dp4
                 # The p3^2, p4^2 come from d^3p in spherical coords
                 # dp3, dp4 handled by trapezoid
@@ -1492,7 +1719,7 @@ class CollisionIntegral2to2Analytical:
         if p1 < 1e-30:
             return 0.0
         F_table = self._ensure_F_forward(p1)
-        
+
         m1, m2, m3, m4 = self.masses
         E1 = np.sqrt(p1**2 + m1**2)
         f1 = float(f_interp(p1))
@@ -1509,7 +1736,7 @@ class CollisionIntegral2to2Analytical:
                 if E4 <= m4 or E4 <= 0:
                     continue
                 p4 = np.sqrt(E4**2 - m4**2)
-                
+
                 f2 = float(f_interp(p2))
                 f3 = float(f_interp(p3))
                 f4 = float(f_interp(p4))
@@ -1517,7 +1744,7 @@ class CollisionIntegral2to2Analytical:
                            else (1.0 - f3))
                 stat_f4 = ((1.0 + f4) if species_stat == 'boson'
                            else (1.0 - f4))
-                
+
                 integrand[i, j] = ((p2**2 / (2.0 * E2))
                                    * (p3**2 / (2.0 * E3))
                                    * F_table[i, j]

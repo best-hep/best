@@ -1,6 +1,6 @@
 """
 BESThep example: thermalization via 2<->2 elastic scattering (massive).
-Run: mpirun -np 4 python 2to2m1.py
+Run: mpirun -np 4 python examples/2to2m1.py
 """
 import numpy as np
 import sys, os
