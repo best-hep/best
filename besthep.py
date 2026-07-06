@@ -212,6 +212,22 @@ def _merge_group_states(gathered):
             widths.setdefault(wkey, {}).update(d)
     return integ, widths
 
+def _slice_integrators_by_color(integ_all, n_groups):
+    """Split a merged (all-groups) vegas-integrator dict into per-color slices
+    for selective distribution at load time.
+
+    Inner keys carry the color as f"{color}_{mode}"; the underscore terminates
+    the color number, so startswith(f"{c}_") cannot cross-match (color 1 does
+    not pick up "17_forward"). Colors with no entries get an empty dict --
+    legacy checkpoints only ever held color 0's slice."""
+    slices = {c: {} for c in range(n_groups)}
+    for c in range(n_groups):
+        pref = f"{c}_"
+        for proc_key, d in (integ_all or {}).items():
+            picked = {k: v for k, v in d.items() if k.startswith(pref)}
+            if picked:
+                slices[c][proc_key] = picked
+    return slices
 
 # ======================================================================
 # Main solver
@@ -1401,14 +1417,58 @@ class BEST:
         print(f"Checkpoint saved: {filename}")
 
     def load_checkpoint(self, filename, matrix_elements=None):
-        """Load checkpoint. Pass matrix_elements={'name': func} to restore."""
+        """Load checkpoint. COLLECTIVE: must be called by ALL ranks together.
+        Pass matrix_elements={'name': func} to restore matrix elements.
+
+        Memory: the heavy payload (per-group vegas integrators; ~MB each,
+        x groups x processes x 2 directions) is NOT broadcast. Rank 0 pops it
+        out of the state and sends each group ONLY its own color's slice
+        (group-leader recv + sub_comm bcast). Broadcasting the merged payload
+        to every rank scales per-node memory with the group count and
+        OOM-kills large jobs (observed: 272 ranks x 1.1 GB checkpoint). Rank 0
+        alone still materializes the full payload -- it already does exactly
+        that when writing the file in save_checkpoint's gather."""
         if self.world_rank == 0:
             print(f"Loading checkpoint: {filename}")
             with open(filename, 'rb') as fh:
                 state = pickle.load(fh)
+            integ_all = state.pop('vegas_integrators', {})
+            # Partition compatibility BEFORE distribution: maps are keyed by
+            # color and adapted on that color's r-block, so on an explicit
+            # mismatch they do not correspond to this run's blocks -> discard
+            # LOUDLY. Legacy checkpoints (no 'n_r_parallel') only ever held
+            # color 0's slice; distribute what exists (pre-fix behavior).
+            saved_groups = state.get('n_r_parallel')
+            if saved_groups is not None and saved_groups != self.n_r_parallel:
+                print(f"  WARNING: checkpoint r-group partition ({saved_groups}) "
+                      f"does not match this run ({self.n_r_parallel}): "
+                      f"discarding restored vegas integrators (they will "
+                      f"re-adapt from scratch).")
+                integ_all = {}
+            slices = _slice_integrators_by_color(integ_all, self.n_r_parallel)
         else:
             state = None
-        state = self.world_comm.bcast(state, root=0)
+        state = self.world_comm.bcast(state, root=0)  # light: integrators popped
+
+        # Route each group its own slice: rank 0 -> group leaders -> sub_comm.
+        # Blocking sends pair with leaders already waiting in recv; pairs are
+        # disjoint, so the pattern cannot deadlock. sub_comm bcast is a no-op
+        # at 1 rank/group.
+        if self.world_rank == 0:
+            my_slice = slices[0]
+            for c in range(1, self.n_r_parallel):
+                self.world_comm.send(slices[c], dest=c * self.ranks_per_group,
+                                     tag=771)
+        elif self.sub_rank == 0 and self.color < self.n_r_parallel:
+            my_slice = self.world_comm.recv(source=0, tag=771)
+        elif self.sub_rank == 0:
+            # orphan group (world_size not divisible by n_r_parallel): holds
+            # no r-block, gets no slice -- must NOT wait for one.
+            my_slice = {}
+        else:
+            my_slice = None
+        self.vegas_integrators = self.sub_comm.bcast(my_slice, root=0)
+
         self.species_config = state['species_config']
         self.species_mass = state.get('species_mass', {})
         self.species_list = list(self.species_config.keys())
@@ -1420,23 +1480,7 @@ class BEST:
         self.r_grids = state.get('r_grids', {})
         self.current_time = state['current_time']
         self.step_count = state['step_count']
-        self.vegas_integrators = state.get('vegas_integrators', {})
         self.adaptive_widths = state.get('adaptive_widths', {})
-        # Integrator maps are keyed by color and were adapted on that color's
-        # r-block. If the group partition changed (different n_r_parallel), the
-        # restored maps do not correspond to this run's momentum blocks: discard
-        # them LOUDLY (fresh adaptation, visible) rather than silently reusing
-        # maps adapted for other momenta. Widths are keyed by GLOBAL r_index and
-        # remain valid under any partition -> kept. Old checkpoints without
-        # 'n_r_parallel' are kept as-is (pre-fix behavior, backward compatible).
-        saved_groups = state.get('n_r_parallel')
-        if saved_groups is not None and saved_groups != self.n_r_parallel:
-            if self.world_rank == 0:
-                print(f"  WARNING: checkpoint written with {saved_groups} r-groups, "
-                      f"this run uses {self.n_r_parallel}: restored vegas "
-                      f"integrators do not match this partition -> discarding "
-                      f"them (integrators will re-adapt from scratch).")
-            self.vegas_integrators = {}
 
         # Lookup for matrix element restoration:
         # 1) user-provided dict, 2) caller's globals, 3) best.py globals
