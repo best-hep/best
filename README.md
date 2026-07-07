@@ -1,5 +1,7 @@
 # BEST — Boltzmann Equation Solver for Thermalization
 
+[Comput. Phys. Commun. 327 (2026) 110295](https://doi.org/10.1016/j.cpc.2026.110295) · [arXiv:2603.28848](https://arxiv.org/abs/2603.28848)
+
 A Python framework for solving the momentum-resolved Boltzmann equation for arbitrary *n* → *m* scattering processes using adaptive Monte Carlo integration.
 
 ## Overview
