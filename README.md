@@ -16,7 +16,8 @@ Key features:
 - **Massive particles** — Arbitrary masses, including time-dependent masses for phase transitions
 - **Multiple coupled species** — Simultaneous evolution of several interacting species
 - **Cosmological expansion** — Comoving momenta with built-in radiation domination
-- **Exponential time integrator (`exprb`)** — Hubble-paced time steps for expansion runs to freeze-out, where explicit steppers become impractically expensive (see *Choosing a time integrator*)
+- **Exponential time integrator (`exprb`)** — Hubble-paced time steps for expansion runs to freeze-out, where explicit steppers become impractically expensive
+- **Sequential exponential integrator (`exprb_seq`)** — Gauss–Seidel splitting over processes for runs where a stiff number-conserving process (elastic scattering) coexists with slow number-changing chemistry; a single summed `exprb` step damps the slow chemistry by the stiff rate, the sequential form does not
 - **Semi-analytical 2→2 benchmark** — Exact energy conservation following [Ala-Mattinen et al. (2022)](https://arxiv.org/abs/2201.06456)
 - **MPI parallelization** — Near-linear scaling to hundreds of cores
 
@@ -44,7 +45,7 @@ examples/
   2to3m1.py           # 2→3 cannibal process
   propagator.py       # momentum-dependent matrix element (s-/t-channel)
   subthreshold_freezeout.py  # sub-threshold freeze-out to relic abundance
-                             # (dof-table cosmology, method='exprb')
+                             # (constant-dof protocol, ann + el, exprb_seq)
 scripts/
   plot.py             # Plot evolution from checkpoint
   compare_rates.py    # Vegas vs analytical benchmark
@@ -166,9 +167,20 @@ solver.set_radiation_dominated(a0=1.0, t0=solver.current_time)
   expensive, while `exprb` runs Hubble-paced dt at one Vegas pass per step.
   First order, positivity-preserving; it does not remove elastic
   shape-relaxation stiffness.
+- `exprb_seq` (sequential / Gauss–Seidel exponential splitting): **use this
+  when a stiff number-conserving process (elastic scattering) runs alongside
+  slow number-changing chemistry** (e.g. the sub-threshold freeze-out example,
+  `ann` + `el`). A single summed `exprb` step damps the slow net rate by the
+  stiff Γ, suppressing the chemistry by ~Γ_stiff·dt; `exprb_seq` instead
+  advances each process over the full dt with its own exponential substep,
+  stiffest first, re-measuring the later processes' rates on the updated f.
+  Costs 2N−1 rate passes per step for N processes; identical to `exprb` for
+  a single process. First-order splitting; run with `adapt_dt=False` in
+  stiff regimes.
 
 ```python
 solver.evolve_step(dt, method='exprb')
+solver.evolve_step(dt, method='exprb_seq', adapt_dt=False)
 ```
 
 ### Multiple species
@@ -200,6 +212,31 @@ examples above). The checkpoint stores the adapted Vegas integrator state of
 every MPI group, so resumed runs continue seamlessly; resuming with a
 different number of momentum groups discards the integrator maps with a
 warning and re-adapts.
+
+## Changelog
+
+### v1.2.1
+
+- New `exprb_seq` time integrator: sequential (Gauss–Seidel) exponential
+  splitting over processes.
+- Near-equilibrium backward rates: direct net-rate integrator with a
+  significance-gated reconstruction (BW = FW + net), removing the
+  near-cancellation noise of subtracting two gross rates.
+- Interior interpolation of log(1/f + η) switched to a monotone (PCHIP)
+  cubic — no spline ringing across populated/empty boundaries.
+- Representation floors extended and made consistent (f resolved down to
+  1e-300 through the interpolator and the rate assembly).
+- Checkpoint resume now restores each MPI group's adaptive integration
+  widths correctly (previously they reverted to stale values on the next
+  save after a resume).
+- `evolve_step` rejects unknown `method` strings instead of silently
+  skipping the update; overflow guard in the adaptive-dt controller for
+  strongly driven Bose-enhanced modes.
+- `solver.verbose = True` exposes estimator internals (BW estimator
+  selection counts, rel_err statistics).
+- Sub-threshold freeze-out example rewritten as the constant-dof protocol
+  run (`ann` + elastic, `exprb_seq`), with matching spectra and yield plot
+  scripts.
 
 ## Citation
 

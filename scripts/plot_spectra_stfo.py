@@ -23,7 +23,7 @@ from matplotlib import cm
 CHECKPOINT   = "checkpoint.pkl"
 BATH_SPECIES = "phi2"      # species whose stored f defines T (loud KeyError if wrong)
 MAX_CURVES   = 40          # max snapshot curves on the left panel
-F_FLOOR      = 1e-30       # lower y-limit for f plots
+F_FLOOR      = 1e-25       # lower y-limit for f plots
 
 # ---------------------------------------------------------------- load
 try:
@@ -80,14 +80,14 @@ for sp in species_list:
         col = cm.rainbow(1.0 - j / max(len(idxs) - 1, 1))
         lab = None
         if j % max(len(idxs) // 5, 1) == 0:
-            lab = f"t = {t[i]:.1e}"
+            lab = f"a = {a[i]:.2f}"
         ax1.plot(q, np.asarray(fs[i], float),
                  color=col, lw=1.0, label=lab)
     # BE overlay at final bath temperature, this species' mass, final a
     E_fin = np.sqrt((q / a[-1]) ** 2 + m ** 2)
     f_be  = 1.0 / (np.exp(np.clip(E_fin / T_fin, 1e-12, 500)) - eta)
     ax1.plot(q, f_be, "k--", lw=2,
-             label=f"BE (T={T_fin:.2g})")
+             label=f"BE (T={T_fin:.2g}, a={a[-1]:.2f})")
     ax1.set_yscale("log")
     ax1.set_ylim(F_FLOOR, None)
     ax1.set_xlabel(r"$q$  (comoving)")

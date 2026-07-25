@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Yield plot Y = n/s vs x = m1/T from a BESThep checkpoint.
+"""Yield plot Y = n/s vs x = m1/T from a BESThep PROTOCOL checkpoint.
+
+CONST-dof pipeline: this script pairs with protocol_subthreshold.py and uses
+the same constant heff = geff = 104.04 for the entropy -- no dof table. Do
+NOT point it at table-dof checkpoints (and do not point the Drees-table plot
+script at protocol checkpoints; mixing the two inflates Y by ~20%).
 
 Hardcoding policy: only the IRREDUCIBLE inputs are declared here --
-  M1_PHYS_GEV : physical mass of phi1 (defines code->GeV conversion; this
-                information exists nowhere in the checkpoint), and
-  DOF_FILE    : the dof table (data needed for the SM entropy density).
+  M1_PHYS_GEV : physical mass of phi1 (code->GeV conversion; not stored in
+                the checkpoint), and
+  HEFF        : the protocol's constant dof (must equal the run script's).
 Everything else -- code-unit masses, statistics, r = m2/m1, a(t), n_com(t),
-and the temperature axis itself -- is derived from the checkpoint. T(t) is
-extracted per snapshot by fitting the stored prescribed-bath distribution
+and the temperature axis -- is derived from the checkpoint. T(t) is fitted
+per snapshot from the stored prescribed-bath distribution
 (log(1/f+eta) = E_phys/T), so no x_init / anchor constants are duplicated
-from the run script (the past x_init 2-vs-5 accident is structurally
-impossible here).
-
-Because T now comes from an INDEPENDENT source (the bath fit, not entropy
-inversion), the printed s*a^3 spread is a genuine consistency check of
-cosmology + fit + unit conversion, not a tautology.
+from the run script.
 """
 import pickle
 import numpy as np
@@ -24,10 +24,15 @@ import matplotlib.pyplot as plt
 
 # ---- irreducible inputs (everything else comes from the checkpoint) ----
 CHECKPOINT   = "checkpoint.pkl"
-DOF_FILE     = "dof_Drees_etal.dat"     # T[GeV]  heff  sqrt(geff)  sqrt(g*)
+HEFF         = 10.2**2                   # = 104.04; MUST match the run script
 M1_PHYS_GEV  = 100.0                     # physical phi1 mass <-> code m1
 BATH_SPECIES = "phi2"
 OUT          = "yield_Y_of_x.png"
+Y_TARGETS    = {"reference fBE": 4.894e-11}                        # optional horizontal reference lines,
+                                         # {label: Y value}; empty by default
+Y_TEMP_YLIM  = (1.2, 1.6)                # y ("temperature") panel window
+                                         # (align with reference code for
+                                         # side-by-side comparison); None = auto
 
 # ---------------------------------------------------------------- load
 try:
@@ -73,30 +78,15 @@ x = m1_code / T_code
 print(f"x = m1/T from bath fits: {x[0]:.3g} .. {x[-1]:.3g}  "
       f"(r = m_bath/m1 = {r_ratio:.3g})")
 
-# --------------------------------------- SM entropy from the dof table
-tab = np.loadtxt(DOF_FILE, skiprows=1)
-T_tab, heff_tab = tab[:, 0], tab[:, 1]
-lo, hi = T_tab.min(), T_tab.max()
-T_GeV = T_code * conv
-if T_GeV.min() < lo or T_GeV.max() > hi:
-    raise SystemExit(f"T range {T_GeV.min():.3g}..{T_GeV.max():.3g} GeV "
-                     f"outside dof table [{lo:.3g}, {hi:.3g}] -- check "
-                     f"M1_PHYS_GEV.")
-order = np.argsort(T_tab)
-heff = np.interp(T_GeV, T_tab[order], heff_tab[order])
-s_phys = (2.0 * np.pi ** 2 / 45.0) * heff * T_GeV ** 3          # GeV^3
-
-# genuine consistency check: comoving entropy must be constant
-s_com = s_phys * a ** 3
-spread = (s_com.max() - s_com.min()) / s_com.mean()
-print(f"s*a^3 spread: {spread:.2e}  "
-      f"(independent check of cosmology + bath fit + conversion)")
+# ----------------------------------------- entropy (protocol: const dof)
+T_GeV  = T_code * conv
+s_phys = (2.0 * np.pi ** 2 / 45.0) * HEFF * T_GeV ** 3          # GeV^3
 
 # ------------------------------------------------------------ Y and Yeq
 n_phys_GeV = (n_com / a ** 3) * conv ** 3
 Y = n_phys_GeV / s_phys
 
-p = np.logspace(-3, 2, 400)                                    # GeV grid
+p = np.logspace(-3, 3, 400)                                    # GeV grid
 m1_GeV = M1_PHYS_GEV
 def n_eq_phys(TG):
     E = np.sqrt(p ** 2 + m1_GeV ** 2)
@@ -104,23 +94,60 @@ def n_eq_phys(TG):
         p ** 2 / (np.exp(np.clip(E / TG, 1e-12, 500)) - eta_1), p)
 Y_eq = np.array([n_eq_phys(TG) for TG in T_GeV]) / s_phys
 
+
+# ------------------------------------------------- y = m * T_chi / s^(2/3)
+# T_chi = <p^2/3E> (DRAKE, below Eq. 11 of 2103.01944). Computed from the
+# stored phi1 snapshots on the comoving grid: q = a*p, E_com = a*E_phys.
+# y_eq uses the SAME moment formula on the equilibrium distribution so that
+# grid-truncation systematics cancel between the two curves (in equilibrium
+# T_chi = T exactly -- ideal-gas identity P = nT).
+if "f" not in history.get(sp, {}):
+    raise SystemExit(f"history['{sp}'] has no 'f' snapshots; y panel needs them")
+q1 = np.asarray(state["r_grids"][sp], float)
+
+def _T_chi_code(f_arr, ai):
+    E_com = np.sqrt(q1 ** 2 + (ai * m1_code) ** 2)
+    num = np.trapezoid(f_arr * q1 ** 4 / E_com, q1)
+    den = 3.0 * ai * max(np.trapezoid(f_arr * q1 ** 2, q1), 1e-300)
+    return num / den                                   # physical, code units
+
+def _y_of(f_arr, ai, T_code_i):
+    TG = T_code_i * conv
+    s_i = (2.0 * np.pi ** 2 / 45.0) * HEFF * TG ** 3
+    return m1_GeV * (_T_chi_code(f_arr, ai) * conv) / s_i ** (2.0 / 3.0)
+
+def _f_eq1(ai, T_code_i):
+    E_com = np.sqrt(q1 ** 2 + (ai * m1_code) ** 2)
+    return 1.0 / (np.exp(np.clip(E_com / (ai * T_code_i), 1e-12, 700)) - eta_1)
+
+y_dm = np.array([_y_of(np.asarray(history[sp]["f"][i], float), a[i], T_code[i])
+                 for i in range(len(t))])
+y_eq = np.array([_y_of(_f_eq1(a[i], T_code[i]), a[i], T_code[i])
+                 for i in range(len(t))])
+
 # ------------------------------------------------------------------ plot
-# Left: yield vs equilibrium. Right: the WHY -- expansion vs realized net
-# chemical rate on the SAME x axis, so the Gamma_net = H crossing aligns
-# with the departure of Y from Y_eq. Twin axis: a(t) and heff(T) (the dof
-# variation; note T itself vs x = m1/T would be a tautology).
 H   = np.gradient(np.log(a), t)
 Gam = np.abs(np.gradient(np.log(np.maximum(n_com, 1e-300)), t))
-below = np.nonzero(Gam < H)[0]
-x_fo = x[below[0]] if below.size else None
 
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(12.5, 5))
+fig, (axL, axM, axR) = plt.subplots(1, 3, figsize=(17.5, 5))
 
 axL.loglog(x, Y, "C0-", lw=2, label=r"$Y$ (phi1)")
 axL.loglog(x, Y_eq, "k--", lw=1.5, label=r"$Y_{\rm eq}$")
+for lab, yt in Y_TARGETS.items():
+    axL.axhline(yt, ls=":", lw=1.2, color="C3" if "fBE" in lab else "gray")
+    axL.text(x[0] * 1.05, yt * 1.1, lab, fontsize=8,
+             color="C3" if "fBE" in lab else "gray")
 axL.set_xlabel(r"$x = m_1/T$")
 axL.set_ylabel(r"$Y = n/s$")
 axL.legend()
+
+axM.semilogx(x, y_dm, "C0-", lw=2, label=r"$y$ (phi1)")
+axM.semilogx(x, y_eq, "k--", lw=1.5, label=r"$y_{\rm eq}$")
+axM.set_xlabel(r"$x = m_1/T$")
+axM.set_ylabel(r"$y = m_1 T_\chi\, s^{-2/3}$")
+axM.legend()
+if Y_TEMP_YLIM is not None:
+    axM.set_ylim(*Y_TEMP_YLIM)
 
 axR.loglog(x, H,   "k-",  lw=2, label=r"$H$")
 axR.loglog(x, Gam, "C0-", lw=2,
@@ -128,22 +155,15 @@ axR.loglog(x, Gam, "C0-", lw=2,
 axR.set_xlabel(r"$x = m_1/T$")
 axR.set_ylabel(r"rate  $[t^{-1}]$")
 axRb = axR.twinx()
-axRb.loglog(x, a,    "C3--", lw=1.5, label=r"$a$")
-axRb.loglog(x, heff, "C2-.", lw=1.5, label=r"$h_{\rm eff}(T)$")
-axRb.set_ylabel(r"$a$,  $h_{\rm eff}$")
+axRb.loglog(x, a, "C3--", lw=1.5, label=r"$a$")
+axRb.set_ylabel(r"$a$")
 h1, l1 = axR.get_legend_handles_labels()
 h2, l2 = axRb.get_legend_handles_labels()
 axR.legend(h1 + h2, l1 + l2, fontsize=9, loc="center left")
 
-if x_fo is not None:
-    for axx in (axL, axR):
-        axx.axvline(x_fo, color="gray", ls=":", lw=1.5)
-    axR.text(x_fo, axR.get_ylim()[0] * 3, r"  $\Gamma_{\rm net}=H$",
-             fontsize=9, color="gray")
-
 fig.suptitle(f"Sub-threshold freeze-out (r = {r_ratio:.2g}), "
-             f"m1 = {M1_PHYS_GEV:g} GeV")
+             f"m1 = {M1_PHYS_GEV:g} GeV, const dof")
 fig.tight_layout()
 fig.savefig(OUT, dpi=130)
-print(f"wrote {OUT}   Y_final = {Y[-1]:.4e}"
-      + (f"   x_freeze-out = {x_fo:.3g}" if x_fo is not None else ""))
+print(f"Y(x_end) = {Y[-1]:.4e}   y(x_end) = {y_dm[-1]:.6f}")
+print(f"wrote {OUT}")

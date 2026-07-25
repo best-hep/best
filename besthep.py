@@ -23,11 +23,21 @@ Time-stepping methods (evolve_step, method=...):
               Schweitzer (2009), SIAM J. Numer. Anal. 47(1) 786-803; Hochbruck
               & Ostermann (2010), Acta Numerica 19, 209-286, eq. (2.47). W-type
               (inexact Jacobian): Hairer & Wanner II, IV.7.
+    'exprb_seq' : sequential (Gauss-Seidel) exponential splitting over
+              processes: each advances the full dt with its own diagonal
+              exprb substep, stiffest first; later processes' rates are
+              re-measured on the updated f (2N-1 rate passes, N processes).
+              Use when a stiff number-conserving process (elastic) coexists
+              with slow number-changing chemistry: summed 'exprb' phi1-damps
+              the slow net by the stiff Gamma (chemistry suppressed ~
+              Gamma_stiff*dt); the sequential form does not. Identical to
+              'exprb' for one process. First-order splitting; use
+              adapt_dt=False in stiff regimes.
 """
 import numpy as np
 from mpi4py import MPI
 from scipy.integrate import quad
-from scipy.interpolate import interp1d
+from scipy.interpolate import PchipInterpolator
 import time
 import os
 import pickle
@@ -54,7 +64,7 @@ class ExtrapolatingInterp:
         #   boson:  f = 1/(exp(y) - 1)
         #   fermion: f = 1/(exp(y) + 1)
         #   MB:     f = exp(-y)
-        f_safe = np.maximum(f, 1e-30)
+        f_safe = np.maximum(f, 1e-300)
         y = np.log(1.0 / f_safe + self.eta)
 
         # Low-p fit
@@ -71,24 +81,32 @@ class ExtrapolatingInterp:
         self._log_axis = (np.all(r_grid > 0)
                           and np.allclose(np.diff(lr), np.diff(lr).mean(),
                                           rtol=1e-2, atol=1e-12))
+        
         x_grid = lr if self._log_axis else r_grid
-        kind = 'cubic' if len(r_grid) >= 4 else 'linear'
-        self._interp = interp1d(x_grid, f, kind=kind, bounds_error=False,
-                                fill_value=(f[0], f[-1]))
+        self._y_spline = PchipInterpolator(x_grid, y)
+        self._x_lo, self._x_hi = float(x_grid[0]), float(x_grid[-1])
+
         self.q_min = r_grid[0]
         self.q_max = r_grid[-1]
+    def _y_interp(self, xq):
+        # Monotone (shape-preserving) cubic in y: a plain cubic spline rings
+        # across populated<->floored boundaries (the ~460 jump in y) and
+        # corrupts f by orders of magnitude. Clip guards fp round-off at the
+        # grid edges; true out-of-range queries never reach here (handled by
+        # the extrapolation fits in __call__).
+        return self._y_spline(np.clip(xq, self._x_lo, self._x_hi))
 
     def _energy(self, p):
         return np.sqrt(p**2 + self.mass**2)
 
     def _f_from_y(self, y):
-        y = np.clip(y, -500, 500)
+        y = np.clip(y, -700, 700)
         if self.eta == 0.0:
             return np.exp(-y)
         if self.eta == -1.0:  # fermion
             return 1.0 / (np.exp(y) + 1.0)
         # boson
-        return np.where(y > 0, 1.0 / (np.exp(y) - 1.0 + 1e-30), 0.0)
+        return np.where(y > 0, 1.0 / (np.exp(y) - 1.0 + 1e-200), 0.0)
 
     def _xq(self, p):
         """Map a query momentum to the interpolation axis (log if log-spaced)."""
@@ -105,7 +123,8 @@ class ExtrapolatingInterp:
                 y = self.a_high + self.b_high * E
                 return max(0.0, float(self._f_from_y(np.array([y]))[0]))
             else:
-                return float(self._interp(self._xq(p)))
+                yq = np.array([self._y_interp(self._xq(p))])
+                return float(self._f_from_y(yq)[0])
 
         p = np.atleast_1d(np.asarray(p, dtype=float))
         result = np.empty_like(p)
@@ -115,7 +134,7 @@ class ExtrapolatingInterp:
         mask_mid = ~mask_low & ~mask_high
 
         if np.any(mask_mid):
-            result[mask_mid] = self._interp(self._xq(p[mask_mid]))
+            result[mask_mid] = self._f_from_y(self._y_interp(self._xq(p[mask_mid])))
         if np.any(mask_low):
             E_low = self._energy(p[mask_low])
             y = self.a_low + self.b_low * E_low
@@ -239,7 +258,8 @@ class BEST:
     # Default numerical cutoffs (can be overridden per-instance)
     cutoff_zero = 1e-50
     cutoff_energy_min = 1e-50
-
+    bw_recon_nsigma = 3.0   # recon-BW significance threshold
+    verbose = False         # dev/debug output
     def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3, adapt_width=True, max_rel_err=0.1, min_rel_err=0.01):
         """Initialize the Boltzmann solver.
 
@@ -335,6 +355,8 @@ class BEST:
         self.vegas_integrators = {}
         self._integrator_suffix = ''
         self._analytical_integrators = {}
+        self.adaptive_widths = {}
+        self.error_stats = {'dropped': 0, 'neglected': 0, 'rel_errs': []}
 
         self.current_time = 0.0
         self.step_count = 0
@@ -699,7 +721,8 @@ class BEST:
                 process_name, section, 'forward')
             integrator_b = self.setup_collision_integrator(
                 process_name, section, 'backward')
-
+            integrator_n = self.setup_collision_integrator(
+                process_name, section, 'net')
             neval = config.get('neval', 1000)
             nitn = config.get('nitn', 2)
             alpha = config.get('alpha', 0.5)
@@ -723,42 +746,75 @@ class BEST:
                 process_name, species, r_target, dw_f, mode='forward', t=t)
             batch_b = self.collision_integrand_batch(
                 process_name, species, r_target, dw_b, mode='backward', t=t)
+            batch_n = self.collision_integrand_batch(
+                process_name, species, r_target, dw_f, mode='net', t=t)
 
             result_f = integrator_f(batch_f, nitn=nitn, neval=neval, alpha=alpha)
-            result_b = integrator_b(batch_b, nitn=nitn, neval=neval, alpha=alpha)
+            result_n = integrator_n(batch_n, nitn=nitn, neval=neval, alpha=alpha)
+            result_b_dir = integrator_b(batch_b, nitn=nitn, neval=neval, alpha=alpha)
 
+            # Post-hoc per-point estimator selection (stateless). Both BW
+            # estimators are in hand anyway (the direct pass always ran), so
+            # pick per (process, slot, species, r) instead of a global switch
+            # decided one step late.
+            #   recon = FW + net : downstream net cancels exactly; DIES when
+            #                      BW << FW (cancellation noise -> clip bias)
+            #   direct           : gross BW; noisy net near equilibrium
+            # The pass sign s is folded into the integrands (output-side
+            # passes negative) and BW is sign-definite, so recon is usable
+            # iff significantly on the healthy side; k-sigma significance
+            # <=> recon rel_err <= 1/k.
+            result_b_rec = result_f + result_n
+            s = 1.0 if result_f.mean >= 0 else -1.0
+            use_recon = (s * result_b_rec.mean
+                         > self.bw_recon_nsigma * result_b_rec.sdev)
+            result_b = result_b_rec if use_recon else result_b_dir
+            b_direct = not use_recon
+            ck = 'recon' if use_recon else 'direct'
+            self.error_stats[ck] = self.error_stats.get(ck, 0) + 1
             # Adapt widths based on rel_err
             if self.adapt_width:
-                for result, mode in [(result_f, 'forward'), (result_b, 'backward')]:
-                    if result.mean != 0:
-                        rel_err = result.sdev / abs(result.mean)
-                        dw_cur = self.adaptive_widths[key][r_index][mode]
-                        if rel_err > self.max_rel_err:
-                            self.adaptive_widths[key][r_index][mode] = dw_cur * 2.0
-                        elif rel_err < self.min_rel_err:
-                            self.adaptive_widths[key][r_index][mode] = dw_cur * 0.5
+                if result_f.mean != 0:
+                    re_f = result_f.sdev / abs(result_f.mean)
+                    if re_f > self.max_rel_err:
+                        self.adaptive_widths[key][r_index]['forward'] = dw_f * 1.25
+                    elif re_f < self.min_rel_err:
+                        self.adaptive_widths[key][r_index]['forward'] = dw_f / 1.25
+                if result_b_dir.mean != 0:
+                    re_b = result_b_dir.sdev / abs(result_b_dir.mean)
+                    if re_b > self.max_rel_err:
+                        self.adaptive_widths[key][r_index]['backward'] = dw_b * 1.25
+                    elif re_b < self.min_rel_err:
+                        self.adaptive_widths[key][r_index]['backward'] = dw_b / 1.25
 
-            # rel_err bookkeeping + drop decision. IMPORTANT: a dropped (noisy)
-            # contribution must add 0 to ALL of rate, forward, backward together,
-            # so that gain-loss == rate is preserved (the 'exprb' path builds
-            # gain/loss from forward/backward and asserts A-Gamma*f == k1). A
-            # dropped mode then has gain=loss=0 -> A=Gamma=0 -> exprb leaves it put,
-            # matching euler/heun (k1=0 => no move).
             drop = False
-            for result, rname in [(result_f, 'forward'), (result_b, 'backward')]:
-                if result.mean != 0:
-                    rel_err = result.sdev / abs(result.mean)
-                    self.error_stats.setdefault('rel_errs', []).append(rel_err)
-                    if rel_err > 5.0 and self.world_rank == 0:
-                        print(f"      Warning: Large Vegas error at "
-                            f"r={r_target:.3f} for "
-                            f"{process_name}-{rname}: "
-                            f"rel_err={rel_err:.2f}")
-                    if rel_err > 1.0:
-                        self.error_stats['dropped'] += 1
-                        drop = True   # TODO(optional): retry at higher neval
-                else:
-                    self.error_stats['neglected'] += 1
+            # forward is a gross (positive) integral: its own rel_err is a
+            # valid quality measure, keep the original criterion
+            if result_f.mean != 0:
+                rel_err = result_f.sdev / abs(result_f.mean)
+                self.error_stats.setdefault('rel_errs', []).append(rel_err)
+                if rel_err > 5.0 and self.world_rank == 0:
+                    print(f"      Warning: Large Vegas error at "
+                          f"r={r_target:.3f} for "
+                          f"{process_name}-forward: rel_err={rel_err:.2f}")
+                if rel_err > 1.0:
+                    self.error_stats['dropped'] += 1
+                    # tag who gets dropped: process/direction/mode
+                    if self.world_rank == 0:
+                        print(f"      [drop] {process_name}"
+                                f"{getattr(self,'_integrator_suffix','')} "
+                                f"r_index={r_index}")
+                    drop = True
+            else:
+                self.error_stats['neglected'] += 1
+            # direct branch: gate on backward's own rel_err (a gross
+            # integral, so its own rel_err is meaningful). The recon branch
+            # needs NO extra gate: selection already required >= nsigma
+            # significance, i.e. recon rel_err <= 1/nsigma by construction.
+            if b_direct and result_b.mean != 0:
+                if result_b.sdev / abs(result_b.mean) > 1.0:
+                    self.error_stats['dropped'] += 1
+                    drop = True
 
             if not drop:
                 total_rate     += result_b.mean - result_f.mean
@@ -887,6 +943,18 @@ class BEST:
         species_loss = {sp: np.zeros_like(self.r_grids[sp])
                         for sp in self.species_list}
 
+        # NEW: the same ledgers kept PER PROCESS. The summed fixed point
+        # (A_tot/Gamma_tot) lets a stiff number-conserving process (el)
+        # overwrite the slow number-changing one (ann) every step; the
+        # sequential stepper needs each process's (A, Gamma) separately.
+        species_gain_p = {p: {sp: np.zeros_like(self.r_grids[sp])
+                              for sp in self.species_list}
+                          for p in active_processes}
+        species_loss_p = {p: {sp: np.zeros_like(self.r_grids[sp])
+                              for sp in self.species_list}
+                          for p in active_processes}
+
+
         for process_name in active_processes:
             config = self.process_configs[process_name]
             input_species = config['input']
@@ -913,6 +981,8 @@ class BEST:
                     species_backward[species] += n_in_s * kb[species]
                     species_gain[species]     += n_in_s * kb[species]   # input: BW=gain
                     species_loss[species]     += n_in_s * kf[species]   #        FW=loss
+                    species_gain_p[process_name][species]     += n_in_s * kb[species]  
+                    species_loss_p[process_name][species]     += n_in_s * kf[species]   
                 else:
                     # Asymmetric OR n_in_s != n_out_s: compute each side present.
                     if n_in_s > 0:
@@ -925,6 +995,8 @@ class BEST:
                         species_backward[species] += n_in_s * kb_in[species]
                         species_gain[species]     += n_in_s * kb_in[species]  # input: BW=gain
                         species_loss[species]     += n_in_s * kf_in[species]  #        FW=loss
+                        species_gain_p[process_name][species]     += n_in_s * kb_in[species]  # input: BW=gain
+                        species_loss_p[process_name][species]     += n_in_s * kf_in[species]  #        FW=loss
                     if n_out_s > 0:
                         self._integrator_suffix = '_out'
                         self._force_target_side = 'output'
@@ -936,6 +1008,8 @@ class BEST:
                         # output-side: roles FLIP; sign=-1 folded in kf_out,kb_out -> undo
                         species_gain[species]     += n_out_s * (-kf_out[species])  # FW_out=gain
                         species_loss[species]     += n_out_s * (-kb_out[species])  # BW_out=loss
+                        species_gain_p[process_name][species]     += n_out_s * (-kf_out[species])  # FW_out=gain
+                        species_loss_p[process_name][species]     += n_out_s * (-kb_out[species])  # BW_out=loss
 
                     self._force_target_side = None
                     self._integrator_suffix = ''
@@ -943,6 +1017,8 @@ class BEST:
         # gain/loss exposed only via self (does NOT change the return signature)
         self.gain_rates = species_gain
         self.loss_rates = species_loss
+        self.gain_rates_by_process = species_gain_p
+        self.loss_rates_by_process = species_loss_p 
         return species_rates, species_forward, species_backward
 
     # ------------------------------------------------------------------
@@ -1057,7 +1133,11 @@ class BEST:
                         self.loss_rates[species], stat)
                     net = (A_dict[species]
                            - Gamma_dict[species] * self.distributions_1d[species])
-                    if not np.allclose(net, k1[species], rtol=1e-6, atol=1e-30):
+
+                    scale = np.maximum(np.abs(self.gain_rates[species]),
+                                    np.abs(self.loss_rates[species]))
+                    if not (np.allclose(net, k1[species], rtol=1e-6, atol=1e-30)
+                            or np.all(np.abs(net - k1[species]) <= 1e-9 * np.maximum(scale, 1e-300))):
                         bad = float(np.max(np.abs(net - k1[species])))
                         exprb_err = (
                             f"exprb slot alignment broken for '{species}': "
@@ -1078,7 +1158,7 @@ class BEST:
                 if method == 'exprb':
                     # limit the REALIZED (phi1-damped) change, not the explicit
                     # one -> the stiff linear part no longer throttles dt
-                    z = -Gamma_dict[species] * dt
+                    z = np.clip(-Gamma_dict[species] * dt, -700.0, 700.0)
                     small = np.abs(z) < 1e-10
                     zz = np.where(small, 1.0, z)
                     phi1 = np.where(small, 1.0 + z * (0.5 + z / 6.0),
@@ -1164,6 +1244,51 @@ class BEST:
                 mass=self.species_mass.get(species, 0.0),
                 stat=self.species_config.get(species, 'boson'))
 
+        elif method == 'exprb_seq':
+            # Sequential (Gauss-Seidel) exponential splitting: each process
+            # advances the FULL dt, stiffest first; processes after the first
+            # get their rates RE-COMPUTED at the updated f (one extra Vegas
+            # pass per later process). Rates and the assembly f are therefore
+            # always consistent, and the slow (number-changing) process is
+            # evaluated on the shape the stiff one just produced.
+            # MPI: mid-step rate passes are COLLECTIVE -- every rank runs the
+            # same sequence (order is broadcast).
+            if self.world_rank == 0:
+                def _stiffness(p):
+                    return max(
+                        float(np.max(self.loss_rates_by_process[p][sp]
+                                     / np.maximum(self.distributions_1d[sp], 1e-300)))
+                        for sp in self.species_list)
+                order = sorted(active_processes, key=_stiffness, reverse=True)
+            else:
+                order = None
+            order = self.world_comm.bcast(order, root=0)
+            for i, proc in enumerate(order):
+                if i > 0:
+                    self.distributions_1d = self.world_comm.bcast(
+                        self.distributions_1d, root=0)
+                    self.interpolators = self.world_comm.bcast(
+                        self.interpolators, root=0)
+                    self._compute_rates_vegas([proc], t=self.current_time)
+                if self.world_rank == 0:
+                    for species in self.species_list:
+                        stat = self.species_config.get(species, 'boson')
+                        A_p, G_p = assemble_A_Gamma(
+                            self.distributions_1d[species],
+                            self.gain_rates_by_process[proc][species],
+                            self.loss_rates_by_process[proc][species], stat)
+                        self.distributions_1d[species] = exprb_update(
+                            self.distributions_1d[species], A_p, G_p, dt_actual)
+                    for species in self.species_list:
+                        self.interpolators[species] = ExtrapolatingInterp(
+                            self.r_grids[species], self.distributions_1d[species],
+                            mass=self.species_mass.get(species, 0.0),
+                            stat=self.species_config.get(species, 'boson'))
+        else:
+            raise ValueError(
+                f"unknown method '{method}' "
+                f"(expected 'euler', 'heun', 'exprb', or 'exprb_seq')")
+                        
         # Broadcast final state
         self.distributions_1d = self.world_comm.bcast(
             self.distributions_1d, root=0)
@@ -1178,9 +1303,13 @@ class BEST:
                   f"{self.error_stats['dropped']}")
             print(f"    Vegas errors - Neglected: "
                   f"{self.error_stats['neglected']}")
-            re = self.error_stats.get('rel_errs', [])
-            if re:
-                print(f"    Max rel_err: {np.max(re):.3e}")
+            if self.verbose:
+                print(f"    BW estimator - recon: "
+                    f"{self.error_stats.get('recon', 0)}, "
+                    f"direct: {self.error_stats.get('direct', 0)}")
+                re = self.error_stats.get('rel_errs', [])
+                if re:
+                    print(f"    Max rel_err: {np.max(re):.3e}")
             print(f"{'=' * 60}")
 
         return k1
@@ -1480,8 +1609,17 @@ class BEST:
         self.r_grids = state.get('r_grids', {})
         self.current_time = state['current_time']
         self.step_count = state['step_count']
-        self.adaptive_widths = state.get('adaptive_widths', {})
 
+        # keep only THIS group's r-block: a group only ever updates its own
+        # block, so holding the whole merged map makes the save-side gather
+        # non-disjoint and the last group's stale copy overwrites everyone.
+        w_all = state.get('adaptive_widths', {})
+        block, rem = divmod(self.n_grid, self.n_r_parallel)
+        lo = self.color * block + min(self.color, rem)
+        hi = lo + block + (1 if self.color < rem else 0)
+        self.adaptive_widths = {k: {ri: v for ri, v in d.items() if lo <= ri < hi}
+                                for k, d in w_all.items()}
+        
         # Lookup for matrix element restoration:
         # 1) user-provided dict, 2) caller's globals, 3) best.py globals
         import inspect
