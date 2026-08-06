@@ -87,12 +87,12 @@ def init_f(r, r0=3.0, width=2.0):
 # ======================================================================
 q_min    = 0.1
 q_max    = 50.0
-n_grid   = 128
+n_grid   = 40
 mass     = 1.0
 coupling = 1.0
 neval    = int(1e6)
 dt       = 1e2
-n_steps  = 1000
+n_steps  = 20
 checkpoint_file = "checkpoint.pkl"
 
 
@@ -137,8 +137,20 @@ for step in range(n_steps):
 Run with MPI:
 
 ```bash
-mpirun -np 4 python3 examples/2to2m1.py
+mpirun -np 8 python3 examples/2to2m1.py
 ```
+### Plotting the results
+
+```bash
+python scripts/plot.py checkpoint.pkl
+```
+
+writes one figure per species: the f(q) snapshot fan plus the N/N₀, E/E₀
+conservation history. The freeze-out example has its own scripts,
+`plot_spectra_stfo.py` and `plot_yield_stfo.py` (run next to `checkpoint.pkl`,
+no arguments). The checkpoint is a plain pickle — `state['history']` holds
+per-step f and moments for custom analysis.
+
 ### 2→3 number-changing process
 
 ```python
@@ -214,6 +226,18 @@ different number of momentum groups discards the integrator maps with a
 warning and re-adapts.
 
 ## Changelog
+
+### v1.2.2
+
+- Tail extrapolation fits in the comoving energy (scale factor passed to the
+  interpolator); removes a slope bias growing with expansion.
+- High-side extrapolation slope: Theil–Sen fit, robust against disturbed
+  boundary modes; separate `n_high` window.
+- Vegas sampling domain extended past the grid top (`domain_extension`,
+  default 1.5×); restores the down-scattering resupply of the top modes,
+  which was truncated at `q_max` and bent the boundary band after freeze-out.
+- `2to2m1.py`: accuracy defaults tightened (neval 10⁵ → 10⁶, fixed narrow
+  energy-conservation width).
 
 ### v1.2.1
 

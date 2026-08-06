@@ -47,8 +47,8 @@ import warnings
 # Interpolation with power-law / exponential extrapolation
 # ======================================================================
 class ExtrapolatingInterp:
-    def __init__(self, r_grid, f, mass=0.0, stat='boson'):
-        self.mass = mass
+    def __init__(self, r_grid, f, mass=0.0, stat='boson', a=1.0):
+        self.mass, self.a = mass, a
         # eta: +1 boson, -1 fermion, 0 Maxwell-Boltzmann
         if stat == 'boson':
             self.eta = 1.0
@@ -57,8 +57,8 @@ class ExtrapolatingInterp:
         else:
             self.eta = 0.0
 
-        # Energy grid: E = sqrt(p^2 + m^2)
-        E_grid = np.sqrt(r_grid**2 + mass**2)
+        # Energy grid: E = sqrt(q^2 + (a m)^2), comoving
+        E_grid = np.sqrt(r_grid**2 + (a * mass)**2)
 
         # Exact form: log(1/f + eta) = a + b*E
         #   boson:  f = 1/(exp(y) - 1)
@@ -72,8 +72,12 @@ class ExtrapolatingInterp:
         self.b_low, self.a_low = np.polyfit(E_grid[:n_low], y[:n_low], 1)
 
         # High-p fit
-        n_high = max(10, len(r_grid) // 10)
-        self.b_high, self.a_high = np.polyfit(E_grid[-n_high:], y[-n_high:], 1)
+        n_high = n_low
+        Ew, yw = E_grid[-n_high:], y[-n_high:]
+        dE = Ew[None, :] - Ew[:, None]; dy = yw[None, :] - yw[:, None]
+        s = dy[dE > 0] / dE[dE > 0]
+        self.b_high = np.median(s)
+        self.a_high = np.median(yw - self.b_high * Ew)
 
         # interpolate on the same axis as the grid scale (auto-detected):
         # log-spaced grid -> log(r) axis; linear grid -> r axis (unchanged).
@@ -97,7 +101,7 @@ class ExtrapolatingInterp:
         return self._y_spline(np.clip(xq, self._x_lo, self._x_hi))
 
     def _energy(self, p):
-        return np.sqrt(p**2 + self.mass**2)
+        return np.sqrt(p**2 + (self.a * self.mass)**2)
 
     def _f_from_y(self, y):
         y = np.clip(y, -700, 700)
@@ -350,6 +354,7 @@ class BEST:
         self.distributions_1d = {}
         self.interpolators = {}
         self.r_grids = {}
+        self.domain_extension = 1.5      # sampled-momentum domain / grid top
 
         self.process_configs = {}
         self.vegas_integrators = {}
@@ -456,7 +461,7 @@ class BEST:
         self.interpolators[species] = ExtrapolatingInterp(
             self.r_grids[species], f_values,
             mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time))
 
         if self.world_rank == 0:
             stat = self.species_config[species]
@@ -488,7 +493,7 @@ class BEST:
             domain = []
             for _ in range(n_integrate):
                 domain.extend([
-                    [self.q_min, self.q_max], [0, np.pi], [0, 2 * np.pi]
+                    [self.q_min, self.q_max * self.domain_extension], [0, np.pi], [0, 2 * np.pi]
                 ])
             if self.sub_rank == 0 and self.world_rank == 0:
                 print(f"  Creating Vegas integrator for {proc_key} ({mode}) "
@@ -1185,7 +1190,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
         elif method == 'heun':
             f_original = {}
@@ -1200,7 +1205,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
             self.distributions_1d = self.world_comm.bcast(
                 self.distributions_1d, root=0)
@@ -1225,7 +1230,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
         elif method == 'exprb':
             # Exponential Rosenbrock-Euler (1-stage, diagonal / W-type).
@@ -1242,7 +1247,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
         elif method == 'exprb_seq':
             # Sequential (Gauss-Seidel) exponential splitting: each process
@@ -1283,7 +1288,7 @@ class BEST:
                         self.interpolators[species] = ExtrapolatingInterp(
                             self.r_grids[species], self.distributions_1d[species],
                             mass=self.species_mass.get(species, 0.0),
-                            stat=self.species_config.get(species, 'boson'))
+                            stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
         else:
             raise ValueError(
                 f"unknown method '{method}' "
@@ -1361,7 +1366,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
         elif method == 'heun':
             f_original = {}
@@ -1376,7 +1381,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
             self.distributions_1d = self.world_comm.bcast(
                 self.distributions_1d, root=0)
@@ -1399,7 +1404,7 @@ class BEST:
                     self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
         # Broadcast
         self.distributions_1d = self.world_comm.bcast(
@@ -1652,7 +1657,7 @@ class BEST:
             self.interpolators[species] = ExtrapolatingInterp(
                 self.r_grids[species], self.distributions_1d[species],
                 mass=self.species_mass.get(species, 0.0),
-                stat=self.species_config.get(species, 'boson'))
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time))
             if species not in self.species_mass:
                 self.species_mass[species] = 0.0
 

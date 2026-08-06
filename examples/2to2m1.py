@@ -1,6 +1,6 @@
 """
 BESThep example: thermalization via 2<->2 elastic scattering (massive).
-Run: mpirun -np 4 python examples/2to2m1.py
+Run: mpirun -np 8 python examples/2to2m1.py
 """
 import numpy as np
 import sys, os
@@ -33,13 +33,13 @@ q_max    = 50.0     # momentum grid upper bound
 n_grid   = 40       # number of momentum grid points
 mass     = 1.0      # phi mass
 coupling = 1.0      # |M|^2 = coupling^2
-neval    = int(1e5) # Vegas evaluations; raise until rel_err stays below max_rel_err
+neval    = int(1e6) # Vegas evaluations; raise until rel_err stays below max_rel_err
 dt       = 1e2      # base time step
 n_steps  = 20       # number of evolution steps
 
 # --- advanced (defaults usually fine) ---
-adapt_width    = True  # auto-adapt width from rel_err; False fixes it at delta_width (debugging/scans)
-delta_width    = 0.1   # Gaussian energy-conservation width (initial value if adapt_width, else fixed)
+adapt_width    = False  # auto-adapt width from rel_err; False fixes it at delta_width (debugging/scans)
+delta_width    = 0.001   # Gaussian energy-conservation width (initial value if adapt_width, else fixed)
 max_rel_err    = 0.1   # widen width above this rel_err (integral too noisy; raise neval)
 min_rel_err    = 0.01  # narrow width below this; raise if evolution stalls, lower as neval grows
 max_rel_change = 0.3   # max relative change of f per step (adaptive dt control)
