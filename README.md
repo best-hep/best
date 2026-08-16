@@ -2,6 +2,8 @@
 
 [Comput. Phys. Commun. 327 (2026) 110295](https://doi.org/10.1016/j.cpc.2026.110295) · [arXiv:2603.28848](https://arxiv.org/abs/2603.28848)
 
+[Talk (Summer Institute 2026)](https://github.com/best-hep/talks/blob/main/20260812_SI2026_YOON.pdf)
+
 A Python framework for solving the momentum-resolved Boltzmann equation for arbitrary *n* → *m* scattering processes using adaptive Monte Carlo integration.
 
 ## Overview
