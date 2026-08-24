@@ -262,9 +262,9 @@ class BEST:
     # Default numerical cutoffs (can be overridden per-instance)
     cutoff_zero = 1e-50
     cutoff_energy_min = 1e-50
-    bw_recon_nsigma = 3.0   # recon-BW significance threshold
     verbose = False         # dev/debug output
-    def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3, adapt_width=True, max_rel_err=0.1, min_rel_err=0.01):
+    bw_fallback_rel_err = 0.3
+    def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3, adapt_width=False, max_rel_err=0.1, min_rel_err=0.0001):
         """Initialize the Boltzmann solver.
 
         Parameters
@@ -659,7 +659,7 @@ class BEST:
                 f_arr.append(np.clip(interps[sp](r_k), 0, None))
 
             # Statistical factors
-            if mode == 'backward' or mode == 'net':
+            if mode in ('backward', 'net', 'joint'):
                 BW = np.ones(N)
                 for k in range(n_in, n_total):
                     BW *= f_arr[k]
@@ -669,7 +669,7 @@ class BEST:
                     elif stats[k] == 'fermion':
                         BW *= (1 - f_arr[k])
 
-            if mode == 'forward' or mode == 'net':
+            if mode in ('forward', 'net', 'joint'):
                 FW = np.ones(N)
                 for k in range(n_in):
                     FW *= f_arr[k]
@@ -679,25 +679,29 @@ class BEST:
                     elif stats[k] == 'fermion':
                         FW *= (1 - f_arr[k])
 
-            if mode == 'backward':
-                stat_factor = sign * BW
-            elif mode == 'forward':
-                stat_factor = sign * FW
-            else:
-                stat_factor = sign * (BW - FW)
-
             momenta_batch = np.stack([mom_x, mom_y, mom_z], axis=1)
             M_sq = matrix_element(momenta_batch, coupling)
+            common = sign * delta_f * phase * M_sq
 
-            result = stat_factor * delta_f * phase * M_sq
-
-            # Zero out unphysical points
             bad = np.zeros(N, dtype=bool)
             for k in range(n_total):
                 bad |= (energies[k] < cutoff_e)
-            result[bad] = 0.0
+            common[bad] = 0.0
 
-            return result
+            if mode == 'joint':
+                # Same sample for FW and BW (lbatch: batch index first).
+                # vegas adapts to column 0 = FW+BW, which covers both peaks;
+                # columns 1, 2 are the estimates actually used.
+                out = np.empty((N, 3))
+                out[:, 0] = (FW + BW) * common
+                out[:, 1] = FW * common
+                out[:, 2] = BW * common
+                return out
+            if mode == 'forward':
+                return FW * common
+            if mode == 'backward':
+                return BW * common
+            return (BW - FW) * common
 
         return integrand
 
@@ -717,114 +721,81 @@ class BEST:
 
         for process_name in active_processes:
             config = self.process_configs[process_name]
-            all_species = config['input'] + config['output']
-            if species not in all_species:
+            if species not in config['input'] + config['output']:
                 continue
 
             section = self.color
-            integrator_f = self.setup_collision_integrator(
-                process_name, section, 'forward')
-            integrator_b = self.setup_collision_integrator(
-                process_name, section, 'backward')
-            integrator_n = self.setup_collision_integrator(
-                process_name, section, 'net')
             neval = config.get('neval', 1000)
-            nitn = config.get('nitn', 2)
+            nitn  = config.get('nitn', 2)
             alpha = config.get('alpha', 0.5)
             dw_default = config.get('delta_width', 0.01)
 
-            # Get adaptive widths (or initialize from default)
-            suffix = getattr(self, '_integrator_suffix', '')
-            key = process_name + suffix
-            if key not in self.adaptive_widths:
-                self.adaptive_widths[key] = {}
-            if r_index not in self.adaptive_widths[key]:
-                self.adaptive_widths[key][r_index] = {
-                    'forward': dw_default,
-                    'backward': dw_default
-                }
+            key = process_name + getattr(self, '_integrator_suffix', '')
+            self.adaptive_widths.setdefault(key, {})
+            self.adaptive_widths[key].setdefault(
+                r_index, {'forward': dw_default})
+            dw = self.adaptive_widths[key][r_index]['forward']   # one width, both directions
 
-            dw_f = self.adaptive_widths[key][r_index]['forward']
-            dw_b = self.adaptive_widths[key][r_index]['backward']
+            # ---- joint pass ----
+            integrator_j = self.setup_collision_integrator(process_name, section, 'joint')
+            batch_j = self.collision_integrand_batch(
+                process_name, species, r_target, dw, mode='joint', t=t)
+            res = integrator_j(batch_j, nitn=nitn, neval=neval, alpha=alpha)
+            result_f, result_b = res[1], res[2]          # correlated gvars
+            result_b_dir = None
 
-            batch_f = self.collision_integrand_batch(
-                process_name, species, r_target, dw_f, mode='forward', t=t)
-            batch_b = self.collision_integrand_batch(
-                process_name, species, r_target, dw_b, mode='backward', t=t)
-            batch_n = self.collision_integrand_batch(
-                process_name, species, r_target, dw_f, mode='net', t=t)
+            # ---- fallback: BW on its own map; chosen by variance ----
+            rel_b = result_b.sdev / abs(result_b.mean) if result_b.mean != 0 else np.inf
+            if rel_b > self.bw_fallback_rel_err:
+                integrator_b = self.setup_collision_integrator(process_name, section, 'backward')
+                batch_b = self.collision_integrand_batch(
+                    process_name, species, r_target, dw, mode='backward', t=t)
+                result_b_dir = integrator_b(batch_b, nitn=nitn, neval=neval, alpha=alpha)
+                if result_b_dir.sdev < result_b.sdev:
+                    result_b = result_b_dir
+                    self.error_stats['bw_fallback'] = self.error_stats.get('bw_fallback', 0) + 1
 
-            result_f = integrator_f(batch_f, nitn=nitn, neval=neval, alpha=alpha)
-            result_n = integrator_n(batch_n, nitn=nitn, neval=neval, alpha=alpha)
-            result_b_dir = integrator_b(batch_b, nitn=nitn, neval=neval, alpha=alpha)
+            if self.verbose and self.world_rank == 0:
+                print(f"      [{key} r={r_index}] FW={result_f}  BW_joint={res[2]}"
+                      + (f"  BW_direct={result_b_dir}" if result_b_dir is not None else ""))
 
-            # Post-hoc per-point estimator selection (stateless). Both BW
-            # estimators are in hand anyway (the direct pass always ran), so
-            # pick per (process, slot, species, r) instead of a global switch
-            # decided one step late.
-            #   recon = FW + net : downstream net cancels exactly; DIES when
-            #                      BW << FW (cancellation noise -> clip bias)
-            #   direct           : gross BW; noisy net near equilibrium
-            # The pass sign s is folded into the integrands (output-side
-            # passes negative) and BW is sign-definite, so recon is usable
-            # iff significantly on the healthy side; k-sigma significance
-            # <=> recon rel_err <= 1/k.
-            result_b_rec = result_f + result_n
-            s = 1.0 if result_f.mean >= 0 else -1.0
-            use_recon = (s * result_b_rec.mean
-                         > self.bw_recon_nsigma * result_b_rec.sdev)
-            result_b = result_b_rec if use_recon else result_b_dir
-            b_direct = not use_recon
-            ck = 'recon' if use_recon else 'direct'
-            self.error_stats[ck] = self.error_stats.get(ck, 0) + 1
-            # Adapt widths based on rel_err
-            if self.adapt_width:
-                if result_f.mean != 0:
-                    re_f = result_f.sdev / abs(result_f.mean)
-                    if re_f > self.max_rel_err:
-                        self.adaptive_widths[key][r_index]['forward'] = dw_f * 1.25
-                    elif re_f < self.min_rel_err:
-                        self.adaptive_widths[key][r_index]['forward'] = dw_f / 1.25
-                if result_b_dir.mean != 0:
-                    re_b = result_b_dir.sdev / abs(result_b_dir.mean)
-                    if re_b > self.max_rel_err:
-                        self.adaptive_widths[key][r_index]['backward'] = dw_b * 1.25
-                    elif re_b < self.min_rel_err:
-                        self.adaptive_widths[key][r_index]['backward'] = dw_b / 1.25
+            # ---- width adaptation on FW only ----
+            if self.adapt_width and result_f.mean != 0:
+                re_f = result_f.sdev / abs(result_f.mean)
+                if re_f > self.max_rel_err:
+                    self.adaptive_widths[key][r_index]['forward'] = dw * 1.25
+                elif re_f < self.min_rel_err:
+                    self.adaptive_widths[key][r_index]['forward'] = dw / 1.25
 
-            drop = False
-            # forward is a gross (positive) integral: its own rel_err is a
-            # valid quality measure, keep the original criterion
-            if result_f.mean != 0:
-                rel_err = result_f.sdev / abs(result_f.mean)
-                self.error_stats.setdefault('rel_errs', []).append(rel_err)
-                if rel_err > 5.0 and self.world_rank == 0:
-                    print(f"      Warning: Large Vegas error at "
-                          f"r={r_target:.3f} for "
-                          f"{process_name}-forward: rel_err={rel_err:.2f}")
-                if rel_err > 1.0:
-                    self.error_stats['dropped'] += 1
-                    # tag who gets dropped: process/direction/mode
-                    if self.world_rank == 0:
-                        print(f"      [drop] {process_name}"
-                                f"{getattr(self,'_integrator_suffix','')} "
-                                f"r_index={r_index}")
-                    drop = True
-            else:
+            # ---- quality control ----
+            if result_f.mean == 0:
                 self.error_stats['neglected'] += 1
-            # direct branch: gate on backward's own rel_err (a gross
-            # integral, so its own rel_err is meaningful). The recon branch
-            # needs NO extra gate: selection already required >= nsigma
-            # significance, i.e. recon rel_err <= 1/nsigma by construction.
-            if b_direct and result_b.mean != 0:
-                if result_b.sdev / abs(result_b.mean) > 1.0:
-                    self.error_stats['dropped'] += 1
-                    drop = True
+                continue
+            rel_f = result_f.sdev / abs(result_f.mean)
+            self.error_stats.setdefault('rel_errs', []).append(rel_f)
+            if rel_f > 1.0:
+                self.error_stats['dropped'] += 1
+                if self.world_rank == 0:
+                    print(f"      [drop] {key} r_index={r_index} rel_err_f={rel_f:.2f}")
+                continue
 
-            if not drop:
-                total_rate     += result_b.mean - result_f.mean
-                total_forward  += result_f.mean
-                total_backward += result_b.mean
+            rel_b = result_b.sdev / abs(result_b.mean) if result_b.mean != 0 else np.inf
+            if rel_b > 1.0:
+                if abs(result_b.mean) + result_b.sdev <= abs(result_f.mean):
+                    # subdominant even at +1 sigma: gain -> 0, measured loss kept
+                    result_b = 0.0 * result_b
+                    self.error_stats['bw_zeroed'] = self.error_stats.get('bw_zeroed', 0) + 1
+                else:
+                    # possibly dominant and unmeasurable: hold the mode and say so
+                    self.error_stats['dropped'] += 1
+                    if self.world_rank == 0:
+                        print(f"      [drop] {key} r_index={r_index} "
+                              f"BW unmeasurable rel_err_b={rel_b:.2f}")
+                    continue
+
+            total_rate     += result_b.mean - result_f.mean
+            total_forward  += result_f.mean
+            total_backward += result_b.mean
 
         return total_rate, total_forward, total_backward
 
@@ -1260,14 +1231,24 @@ class BEST:
             # same sequence (order is broadcast).
             if self.world_rank == 0:
                 def _stiffness(p):
-                    return max(
-                        float(np.max(self.loss_rates_by_process[p][sp]
-                                     / np.maximum(self.distributions_1d[sp], 1e-300)))
-                        for sp in self.species_list)
+                    gamma_bulk = 0.0
+                    for sp in self.species_list:
+                        q = self.r_grids[sp]
+                        f = self.distributions_1d[sp]
+                        loss = self.loss_rates_by_process[p][sp]
+                        n = np.trapezoid(f * q**2, q)
+                        if n > 0:
+                            gamma_bulk = max(gamma_bulk,
+                                            float(np.trapezoid(loss * q**2, q) / n))
+                    return gamma_bulk
+
+
                 order = sorted(active_processes, key=_stiffness, reverse=True)
             else:
                 order = None
             order = self.world_comm.bcast(order, root=0)
+            if self.world_rank == 0 and self.verbose:
+                print(f"    [GS] order: {order}")
             for i, proc in enumerate(order):
                 if i > 0:
                     self.distributions_1d = self.world_comm.bcast(
@@ -1284,11 +1265,14 @@ class BEST:
                             self.loss_rates_by_process[proc][species], stat)
                         self.distributions_1d[species] = exprb_update(
                             self.distributions_1d[species], A_p, G_p, dt_actual)
+                    a_rebuild = self.scale_factor(
+                        self.current_time + dt_actual if i == len(order) - 1
+                        else self.current_time)
                     for species in self.species_list:
                         self.interpolators[species] = ExtrapolatingInterp(
                             self.r_grids[species], self.distributions_1d[species],
                             mass=self.species_mass.get(species, 0.0),
-                            stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
+                            stat=self.species_config.get(species, 'boson'), a=a_rebuild)
         else:
             raise ValueError(
                 f"unknown method '{method}' "
@@ -1309,12 +1293,12 @@ class BEST:
             print(f"    Vegas errors - Neglected: "
                   f"{self.error_stats['neglected']}")
             if self.verbose:
-                print(f"    BW estimator - recon: "
-                    f"{self.error_stats.get('recon', 0)}, "
-                    f"direct: {self.error_stats.get('direct', 0)}")
+                print(f"    BW fallback: {self.error_stats.get('bw_fallback', 0)}, "
+                      f"zeroed: {self.error_stats.get('bw_zeroed', 0)}")
                 re = self.error_stats.get('rel_errs', [])
                 if re:
                     print(f"    Max rel_err: {np.max(re):.3e}")
+                    print(f"    Min rel_err: {np.min(re):.3e}")
             print(f"{'=' * 60}")
 
         return k1

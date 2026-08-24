@@ -229,6 +229,19 @@ warning and re-adapts.
 
 ## Changelog
 
+### v1.2.3
+
+- Backward (gain) rates: single joint Vegas evaluation of (FW+BW, FW, BW)
+  on common sample points; the net is the correlated difference. Deep-tail
+  gains become measurable. Supersedes the v1.2.1 reconstruction gate
+  (removed, with `bw_recon_nsigma` and the per-direction width entry).
+- BW fallback to its own adaptive map when the joint error is poor;
+  unmeasurable modes are held or zeroed (subdominant only). Counts and
+  min/max rel. error in the `verbose` step summary.
+- `exprb_seq`: stiffness ordering now uses the f-weighted bulk loss rate
+  per process (previously the per-mode maximum); mid-step interpolator
+  rebuilds use a(t), the final one a(t+dt).
+
 ### v1.2.2
 
 - Tail extrapolation fits in the comoving energy (scale factor passed to the
@@ -245,9 +258,10 @@ warning and re-adapts.
 
 - New `exprb_seq` time integrator: sequential (Gauss–Seidel) exponential
   splitting over processes.
-- Near-equilibrium backward rates: direct net-rate integrator with a
+- ~~Near-equilibrium backward rates: direct net-rate integrator with a
   significance-gated reconstruction (BW = FW + net), removing the
-  near-cancellation noise of subtracting two gross rates.
+  near-cancellation noise of subtracting two gross rates.~~
+  *(superseded in v1.2.3)*
 - Interior interpolation of log(1/f + η) switched to a monotone (PCHIP)
   cubic — no spline ringing across populated/empty boundaries.
 - Representation floors extended and made consistent (f resolved down to
