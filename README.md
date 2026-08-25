@@ -72,7 +72,7 @@ from besthep import BEST
 # Matrix element
 # ======================================================================
 def matrix_element(momenta, coupling):
-    """Constant |M|^2. Symmetry factors included in coupling."""
+    """Constant |M|^2 = coupling**2; symmetry factors absorbed into coupling (see examples/2to2m1.py)."""
     return np.full(momenta.shape[2], coupling**2)
 
 
@@ -241,6 +241,7 @@ warning and re-adapts.
 - `exprb_seq`: stiffness ordering now uses the f-weighted bulk loss rate
   per process (previously the per-mode maximum); mid-step interpolator
   rebuilds use a(t), the final one a(t+dt).
+- `2to2m1.py`: docstring documents the `coupling`/`matrix_element` convention (symmetry factors assumed included in |M|²).
 
 ### v1.2.2
 
