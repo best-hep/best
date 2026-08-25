@@ -1,5 +1,5 @@
 """
-BESThep: Boltzmann Equation Solver for Thermalization (hep)
+BEST-hep: Boltzmann Equation Solver for Thermalization (hep)
 
 A general-purpose solver for momentum-resolved Boltzmann equations
 using Vegas Monte Carlo integration. Supports arbitrary n->m processes.
@@ -367,7 +367,7 @@ class BEST:
         self.step_count = 0
         self.scale_factor = lambda t: 1.0  # default: no expansion
         if self.world_rank == 0:
-            print(f"BESThep initialized")
+            print(f"BEST-hep initialized")
             print(f"q_min = {q_min}, q_max = {q_max}, grid size = {n_grid}")
             print(f"MPI: {self.world_size} total ranks, "
                   f"{self.n_r_parallel} r-groups, "
@@ -402,7 +402,7 @@ class BEST:
     # Process registration
     # ------------------------------------------------------------------
     def add_process(self, name, input_species, output_species, matrix_element,
-                    coupling=1.0, neval=1000, nitn=2, alpha=0.5,
+                    coupling=1.0, neval=1000000, nitn=2, alpha=0.5,
                     delta_width=0.01):
         self.process_configs[name] = {
             'input': input_species,

@@ -1,5 +1,5 @@
 """
-BESThep example: thermalization via 2<->3 cannibal process.
+BEST-hep example: thermalization via 2<->3 cannibal process.
 
 Run: mpirun -np 272 python 2to3m1.py
 """
