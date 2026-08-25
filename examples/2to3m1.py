@@ -13,6 +13,8 @@ from besthep import BEST
 # ======================================================================
 def matrix_element(momenta, coupling):
     """Constant |M|^2. Symmetry factors included in coupling."""
+    # If coupling is the Lagrangian coupling lam5 of L = -(lam5/5!) phi^5, use instead:
+    # return np.full(momenta.shape[2], coupling**2 / (2*6))   # 2!*3!
     return np.full(momenta.shape[2], coupling**2)
 
 # ======================================================================
