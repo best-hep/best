@@ -229,6 +229,10 @@ warning and re-adapts.
 
 ## Changelog
 
+### v1.2.4
+- Checkpoints store vegas AdaptiveMaps instead of full Integrators;
+  fixes the MPI gather overflow at large neval.
+
 ### v1.2.3
 
 - Backward (gain) rates: single joint Vegas evaluation of (FW+BW, FW, BW)

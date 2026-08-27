@@ -501,6 +501,10 @@ class BEST:
                       flush=True)
             self.vegas_integrators[proc_key][key] = \
                 self._vegas.Integrator(domain, mpi=True)
+        entry = self.vegas_integrators[proc_key][key]
+        if not isinstance(entry, self._vegas.Integrator):
+            # restored from checkpoint as AdaptiveMap: rebuild the Integrator on it
+            self.vegas_integrators[proc_key][key] = self._vegas.Integrator(entry, mpi=True)
         return self.vegas_integrators[proc_key][key]
 
     # ------------------------------------------------------------------
@@ -825,7 +829,7 @@ class BEST:
                 mass = self.species_mass.get(species, 0.0)
                 print(f"\n  Computing C[f] for {species} "
                       f"({stat}, m={mass}, a={self.scale_factor(t):.4f}):")
-                print(f"    Grid points: {len(self.r_grids[species])}")
+                print(f"    Grid points: {len(self.r_grids[species])}", flush=True)
 
             n_r = len(self.r_grids[species])
             rates_local = np.zeros_like(self.r_grids[species])
@@ -1079,7 +1083,7 @@ class BEST:
             print(f"\n{'=' * 60}")
             print(f"Step {self.step_count} | t = {self.current_time:.3e} "
                   f"| dt = {dt:.3e} | method = {method}")
-            print(f"{'=' * 60}")
+            print(f"{'=' * 60}", flush=True)
 
         self.r_grids = self.world_comm.bcast(self.r_grids, root=0)
         self.distributions_1d = self.world_comm.bcast(
@@ -1299,7 +1303,7 @@ class BEST:
                 if re:
                     print(f"    Max rel_err: {np.max(re):.3e}")
                     print(f"    Min rel_err: {np.min(re):.3e}")
-            print(f"{'=' * 60}")
+            print(f"{'=' * 60}", flush=True)
 
         return k1
 
@@ -1500,8 +1504,11 @@ class BEST:
         group leader's dicts to rank 0 and merge before pickling."""
         contrib = None
         if self.sub_rank == 0:
-            contrib = (self.color, self.vegas_integrators, self.adaptive_widths)
+            maps = {pk: {k: getattr(integ, 'map', integ) for k, integ in d.items()}
+                    for pk, d in self.vegas_integrators.items()}
+            contrib = (self.color, maps, self.adaptive_widths)
         gathered = self.world_comm.gather(contrib, root=0)
+
         if self.world_rank != 0:
             return
         integ_all, widths_all = _merge_group_states(gathered)
