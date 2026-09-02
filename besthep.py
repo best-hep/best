@@ -634,32 +634,41 @@ class BEST:
             energies[conserved_idx] = np.sqrt(
                 pc_mag_sq + masses[conserved_idx]**2)
 
-            # Energy conservation delta
+            # ---- on-shell projection (replaces the Gaussian-width block) ----
+            m_col = np.asarray(masses, float)[:, None]                 # (n_total, 1)
+            K = (energies**2 - m_col**2) / (energies + m_col)          # E - m, no cancellation
             E_in = np.sum(energies[:n_in], axis=0)
             E_out = np.sum(energies[n_in:], axis=0)
-            E_diff = np.abs(E_in - E_out)
+            dE = E_in - E_out
 
-            eff_width = delta_width * (E_in + E_out) /2.
+            w = np.ones(n_total); w[target_idx] = 0.0                  # observed particle not moved
+            K_tot = np.maximum((K * w[:, None]).sum(axis=0), 1e-12 * (E_in + E_out))
+            lam = dE / K_tot
+            scale = np.where(np.arange(n_total)[:, None] < n_in, 1.0 - lam, 1.0 + lam)
+            scale[target_idx] = 1.0
+            K_p = np.clip(K * scale, 0.0, None)                        # E_in' == E_out' exactly; invalid configs masked below
+            E_p = K_p + m_col
+            p_p = np.sqrt(K_p * (K_p + 2.0 * m_col))
+
+            eff_width = delta_width * K_tot                            # sigma_E = delta * K_tot
             norm_d = 1.0 / (eff_width * np.sqrt(2 * np.pi))
-            delta_f = norm_d * np.exp(-E_diff**2 / (2 * eff_width**2))
+            delta_f = norm_d * np.exp(-dE**2 / (2 * eff_width**2))
+            delta_f[np.abs(dE) > K_tot] = 0.0                          # no proportional projection; weight ~ exp(-1/(2 delta^2)), cut is lossless
 
-            # Phase space: 1 / prod(2E)
+            # Phase space: 1 / prod(2E) at the projected energies
             prod_2E = np.ones(N)
             for k in range(n_total):
-                prod_2E *= 2.0 * energies[k]
-            phase = g_factor * jacobian / (prod_2E * pi_power)
+                prod_2E *= 2.0 * E_p[k]
+            phase = g_factor * jacobian / (np.maximum(prod_2E, 1e-300) * pi_power)
 
-            # Distribution functions
+            # Distribution functions at the projected comoving momenta
             f_arr = []
             for k in range(n_total):
                 sp = all_species[k]
                 if k == target_idx:
                     r_k = np.full(N, q1_mag)
-                elif k == conserved_idx:
-                    r_k = np.sqrt(pc_mag_sq)* a
                 else:
-                    int_pos = integrate_indices.index(k)
-                    r_k = x[:, int_pos * 3]
+                    r_k = p_p[k] * a
                 f_arr.append(np.clip(interps[sp](r_k), 0, None))
 
             # Statistical factors
@@ -714,8 +723,6 @@ class BEST:
     # ------------------------------------------------------------------
     def compute_collision_rate(self, r_target, species, active_processes,
                             r_index=0, t=0.0):
-        if not hasattr(self, 'error_stats'):
-            self.error_stats = {'dropped': 0, 'neglected': 0, 'rel_errs': []}
         if not hasattr(self, 'adaptive_widths'):
             self.adaptive_widths = {}
 
@@ -1595,14 +1602,14 @@ class BEST:
         self.vegas_integrators = self.sub_comm.bcast(my_slice, root=0)
 
         self.species_config = state['species_config']
-        self.species_mass = state.get('species_mass', {})
+        self.species_mass = state['species_mass']
         self.species_list = list(self.species_config.keys())
-        self.species_dof = state.get('species_dof', {s: 1 for s in self.species_list})
+        self.species_dof = state['species_dof']
         self.q_min = state['q_min']
         self.q_max = state['q_max']
         self.n_grid = state['n_grid']
         self.distributions_1d = state['distributions_1d']
-        self.r_grids = state.get('r_grids', {})
+        self.r_grids = state['r_grids']
         self.current_time = state['current_time']
         self.step_count = state['step_count']
 
@@ -1615,7 +1622,6 @@ class BEST:
         hi = lo + block + (1 if self.color < rem else 0)
         self.adaptive_widths = {k: {ri: v for ri, v in d.items() if lo <= ri < hi}
                                 for k, d in w_all.items()}
-        
         # Lookup for matrix element restoration:
         # 1) user-provided dict, 2) caller's globals, 3) best.py globals
         import inspect

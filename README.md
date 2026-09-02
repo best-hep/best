@@ -229,6 +229,16 @@ warning and re-adapts.
 
 ## Changelog
 
+### v1.2.5
+- Energy conservation: the Gaussian width no longer smears the physics.
+  Each sample is projected onto the exact E_in = E_out shell (kinetic
+  energies rescaled by (1 ∓ λ) on the initial/final side, λ = ΔE/K_tot,
+  observed leg fixed) and f is read there; the Gaussian only weights how
+  far off-shell the sample was. Since the projection displacement is odd
+  in ΔE and the weight is even, the first-order error cancels and the
+  residual is O(`delta_width`²). Width is `delta_width` × K_tot of the
+  non-observed legs.
+
 ### v1.2.4
 - Checkpoints store vegas AdaptiveMaps instead of full Integrators;
   fixes the MPI gather overflow at large neval.
