@@ -229,15 +229,19 @@ warning and re-adapts.
 
 ## Changelog
 
+### v1.2.6
+- Sampling frame aligned with the observed momentum (target on the polar
+  axis) and one azimuth integrated out by rotational symmetry: results
+  identical, one fewer integration dimension.
+- `adapt_width`: widening capped at `delta_width` = 0.05.
+
 ### v1.2.5
-- Energy conservation: the Gaussian width no longer smears the physics.
-  Each sample is projected onto the exact E_in = E_out shell (kinetic
-  energies rescaled by (1 ∓ λ) on the initial/final side, λ = ΔE/K_tot,
-  observed leg fixed) and f is read there; the Gaussian only weights how
-  far off-shell the sample was. Since the projection displacement is odd
-  in ΔE and the weight is even, the first-order error cancels and the
-  residual is O(`delta_width`²). Width is `delta_width` × K_tot of the
-  non-observed legs.
+- Energy conservation by on-shell projection: each sample is projected onto
+  the exact E_in = E_out shell (kinetic energies rescaled by (1 ∓ λ) on the
+  initial/final side, λ = ΔE/K_tot, observed leg fixed) and f is read there;
+  the Gaussian only weights how far off-shell the sample was. Equilibrium is
+  therefore an exact fixed point (gain − loss vanishes sample by sample), and
+  the width `delta_width` × K_tot keeps tracking the shell as T drops.
 
 ### v1.2.4
 - Checkpoints store vegas AdaptiveMaps instead of full Integrators;

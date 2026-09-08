@@ -490,11 +490,16 @@ class BEST:
         if key not in self.vegas_integrators[proc_key]:
             config = self.process_configs[process_name]
             n_integrate = config['n_in'] + config['n_out'] - 2
+            # Rotational symmetry about the target axis: the azimuth of the
+            # first integrated leg is fixed at 0 (its 2*pi is folded into the
+            # Jacobian), so the domain has 3*n_integrate - 1 dimensions.
             domain = []
-            for _ in range(n_integrate):
+            for k_leg in range(n_integrate):
                 domain.extend([
-                    [self.q_min, self.q_max * self.domain_extension], [0, np.pi], [0, 2 * np.pi]
+                    [self.q_min, self.q_max * self.domain_extension], [0, np.pi]
                 ])
+                if k_leg > 0:
+                    domain.append([0, 2 * np.pi])
             if self.sub_rank == 0 and self.world_rank == 0:
                 print(f"  Creating Vegas integrator for {proc_key} ({mode}) "
                       f"[group {self.color}]: {len(domain)} dimensions",
@@ -586,18 +591,23 @@ class BEST:
             mom_z = np.zeros((n_total, N))
             energies = np.zeros((n_total, N))
 
-            # Target along x-axis
-            mom_x[target_idx] = q1_mag / a
+            # Target along the z-axis (= polar axis of the sampled legs), so the
+            # rotational symmetry about it is a common shift of all azimuths
+            mom_z[target_idx] = q1_mag / a
             energies[target_idx] = np.sqrt(q1_mag**2 / a**2 + masses[target_idx]**2)
 
             # Integrated particles
-            jacobian = np.ones(N)
+            jacobian = np.full(N, 2.0 * np.pi)   # azimuth of the first leg integrated out
             x_idx = 0
-            for part_idx in integrate_indices:
+            for k_leg, part_idx in enumerate(integrate_indices):
                 q = x[:, x_idx]
                 theta = x[:, x_idx + 1]
-                phi = x[:, x_idx + 2]
-                x_idx += 3
+                if k_leg == 0:
+                    phi = np.zeros(N)
+                    x_idx += 2
+                else:
+                    phi = x[:, x_idx + 2]
+                    x_idx += 3
 
                 sin_theta = np.sin(theta)
                 jacobian *= q**2 * sin_theta / a**3
@@ -774,7 +784,7 @@ class BEST:
             if self.adapt_width and result_f.mean != 0:
                 re_f = result_f.sdev / abs(result_f.mean)
                 if re_f > self.max_rel_err:
-                    self.adaptive_widths[key][r_index]['forward'] = dw * 1.25
+                    self.adaptive_widths[key][r_index]['forward'] = min(dw * 1.25, 0.05)
                 elif re_f < self.min_rel_err:
                     self.adaptive_widths[key][r_index]['forward'] = dw / 1.25
 
