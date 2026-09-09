@@ -1439,13 +1439,14 @@ class BEST:
         """
         history = {'times': [], 'a': []}
         for species in self.species_list:
-            history[species] = {'f': [], 'n': [], 'e': []}
-        m = self.compute_moments()
+            history[species] = {'f': [], 'n': [], 'e': [], 'm': []}
+        moments = self.compute_moments()
         for species in self.species_list:
             history[species]['f'].append(
                 self.distributions_1d[species].copy())
-            history[species]['n'].append(m[species]['n'])
-            history[species]['e'].append(m[species]['e'])
+            history[species]['n'].append(moments[species]['n'])
+            history[species]['e'].append(moments[species]['e'])
+            history[species]['m'].append(self.species_mass[species])
         history['a'].append(self.scale_factor(self.current_time))
         history['times'].append(self.current_time)
         return history
@@ -1462,19 +1463,20 @@ class BEST:
             m = solver.record(history)
             print(f"E = {m['phi']['e']}")
         """
-        m = self.compute_moments()
+        moments = self.compute_moments()
         for species in self.species_list:
             if species not in history:
-                history[species] = {'f': [], 'n': [], 'e': []}
+                history[species] = {'f': [], 'n': [], 'e': [], 'm': []}
             history[species]['f'].append(
                 self.distributions_1d[species].copy())
-            history[species]['n'].append(m[species]['n'])
-            history[species]['e'].append(m[species]['e'])
+            history[species]['n'].append(moments[species]['n'])
+            history[species]['e'].append(moments[species]['e'])
+            history[species]['m'].append(self.species_mass[species])
         if 'a' not in history:
             history['a'] = []
         history['a'].append(self.scale_factor(self.current_time))
         history['times'].append(self.current_time)
-        return m
+        return moments
 
     # ------------------------------------------------------------------
     # Moments

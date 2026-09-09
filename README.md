@@ -229,6 +229,9 @@ warning and re-adapts.
 
 ## Changelog
 
+### v1.2.7
+- History records each species' mass per snapshot (time-dependent masses).
+
 ### v1.2.6
 - Sampling frame aligned with the observed momentum (target on the polar
   axis) and one azimuth integrated out by rotational symmetry: results
