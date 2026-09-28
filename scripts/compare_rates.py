@@ -1,6 +1,8 @@
 """
 Compare Vegas vs Analytical collision rates.
 Computes C[f](p) once from the same initial distribution using both methods.
+Both paths use the bare |M|^2 and apply the symmetry factor for identical particles
+(1/(2!*2!) here) inside besthep, so the two rates must agree point by point.
 
 Run: mpirun -np <N> python3 compare_rates.py
 """
@@ -16,12 +18,10 @@ GAMMA = 1.0
 # ======================================================================
 # Matrix element
 # ======================================================================
-def matrix_element_constant(momenta, coupling):
-    if momenta is not None and momenta.ndim == 3:
-        return np.full(momenta.shape[2], coupling**2)
-    return coupling**2
+def matrix_element_constant(momenta):
+    return np.full(momenta.shape[2], coupling**2)
 
-def matrix_element_tchannel(momenta, coupling):
+def matrix_element_tchannel(momenta):
     """Vegas: t-channel Breit-Wigner, t = (p1 - p3)^2."""
     E1 = np.sqrt(np.sum(momenta[0]**2, axis=0) + mass**2)
     E3 = np.sqrt(np.sum(momenta[2]**2, axis=0) + mass**2)
@@ -30,7 +30,7 @@ def matrix_element_tchannel(momenta, coupling):
     return coupling**2 / ((t - M_MED**2)**2 + (GAMMA * M_MED)**2)
 
 def M_squared_tchannel(t):
-    """Analytical: same Breit-Wigner as a function of t."""
+    """Analytical: same Breit-Wigner as a function of t (bare |M|^2)."""
     return coupling**2 / ((t - M_MED**2)**2 + (GAMMA * M_MED)**2)
 # ======================================================================
 # Initial condition
@@ -71,7 +71,7 @@ solver.initialize_species(
 solver.add_process(
     'phi_2to2', ['phi', 'phi'], ['phi', 'phi'],
     matrix_element_constant,
-    coupling=coupling, neval=neval, nitn=2,
+    neval=neval, nitn=2,
     delta_width=delta_width)
 
 # ======================================================================
@@ -89,18 +89,15 @@ rates_vegas, _, _ = solver._compute_rates_vegas(
 if solver.world_rank == 0:
     print("\n=== Computing Analytical rates ===")
 
+# M_squared=None reads the constant bare |M|^2 off the process' function;
+# for the t-channel test register matrix_element_tchannel above and pass
+# M_squared=M_squared_tchannel here.
 rates_anal = solver._compute_rates_all_species('phi_2to2', n_F=n_grid, M_squared=None)
 
 # ======================================================================
 # Save and plot (rank 0 only)
 # ======================================================================
 if solver.world_rank == 0:
-    ci = solver._analytical_integrators[
-        list(solver._analytical_integrators.keys())[0]]
-    f_interp = solver.interpolators['phi']
-
-
-
     for sp in solver.species_list:
         r_grid = solver.r_grids[sp]
         rv = rates_vegas[sp]
@@ -133,13 +130,8 @@ if solver.world_rank == 0:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
-
         ratio = np.where(np.abs(ra) > 1e-30, rv / ra, np.nan)
         ax2.semilogx(r_grid, ratio, 'ko', ms=3)
-
-#        mask = np.abs(ra) > np.max(np.abs(ra)) * 1e-8
-#        if np.any(mask):
-#            ax2.semilogx(r_grid[mask], rv[mask] / ra[mask], 'ko', ms=3)
         ax2.axhline(1.0, color='r', ls='--')
         ax2.set_xlabel('|p|')
         ax2.set_ylabel('Vegas / Analytical')

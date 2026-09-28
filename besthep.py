@@ -1,5 +1,5 @@
 """
-BEST-hep: Boltzmann Equation Solver for Thermalization (hep)
+BEST-hep: Boltzmann Equation Solver for Thermalization (high energy physics)
 
 A general-purpose solver for momentum-resolved Boltzmann equations
 using Vegas Monte Carlo integration. Supports arbitrary n->m processes.
@@ -9,7 +9,9 @@ Usage:
     solver = BEST(q_min=0.1, q_max=20.0)
     solver.initialize_species('phi', my_init_func, stat='boson', mass=1.0)
     solver.add_process('my_process', ['phi','phi'], ['phi','phi','phi'],
-                       my_matrix_element, coupling=1.0, neval=1e6)
+                       my_matrix_element_squared, neval=1e6)
+    # my_matrix_element_squared(momenta) returns the bare |M|^2 with the couplings
+    # inside; the symmetry factor for identical particles is applied automatically.
     solver.evolve_step(dt=1.0, method='exprb')   # exponential Rosenbrock-Euler
 
 Time-stepping methods (evolve_step, method=...):
@@ -262,6 +264,8 @@ class BEST:
     # Default numerical cutoffs (can be overridden per-instance)
     cutoff_zero = 1e-50
     cutoff_energy_min = 1e-50
+    f_floor = 1e-300        # occupation floor applied to every initial distribution: log interpolation, all-zero detection
+    f_seed = 1e-10        # amplitude of the production-spectrum seed for all-zero species
     verbose = False         # dev/debug output
     bw_fallback_rel_err = 0.3
     def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3, adapt_width=False, max_rel_err=0.1, min_rel_err=0.0001):
@@ -322,10 +326,10 @@ class BEST:
             n_r_parallel = self.world_size
         self.n_r_parallel = min(n_r_parallel, self.world_size)
 
+        if self.world_size % self.n_r_parallel != 0:
+            raise ValueError(f"n_r_parallel = {self.n_r_parallel} must divide the number of "
+                             f"MPI ranks ({self.world_size})")
         ranks_per_group = self.world_size // self.n_r_parallel
-        if ranks_per_group < 1:
-            ranks_per_group = 1
-            self.n_r_parallel = self.world_size
         self.ranks_per_group = ranks_per_group
 
         self.color = self.world_rank // ranks_per_group
@@ -357,6 +361,7 @@ class BEST:
         self.domain_extension = 1.5      # sampled-momentum domain / grid top
 
         self.process_configs = {}
+        self._empty_species = set()      # species initialized at the floor: seeded at the first step
         self.vegas_integrators = {}
         self._integrator_suffix = ''
         self._analytical_integrators = {}
@@ -401,14 +406,32 @@ class BEST:
     # ------------------------------------------------------------------
     # Process registration
     # ------------------------------------------------------------------
-    def add_process(self, name, input_species, output_species, matrix_element,
-                    coupling=1.0, neval=1000000, nitn=2, alpha=0.5,
-                    delta_width=0.01):
+    def add_process(self, name, input_species, output_species, matrix_element_squared,
+                    neval=1000000, nitn=2, alpha=0.5, delta_width=0.01,
+                    symmetry_factor='auto'):
+        """Register a process.
+
+        matrix_element_squared(momenta): the bare |M|^2 with the couplings inside,
+        summed/averaged over degrees of freedom, without identical-particle
+        factors. momenta has shape (n_particles, 3, batch): the 3-momenta
+        (px, py, pz) of the particles in the order input + output, for a batch
+        of Vegas points; return one value per batch point (energies are on
+        shell, E = sqrt(p^2 + m^2)).
+        symmetry_factor: symmetry factor for identical particles multiplying |M|^2. 'auto'
+        (default) is 1/(prod_s n_in,s! * prod_s n_out,s!) from the species lists;
+        a number overrides it (1.0 if the function already contains the factor).
+        """
+        from math import factorial
+        if symmetry_factor == 'auto':
+            symmetry_factor = 1.0
+            for s in set(input_species) | set(output_species):
+                symmetry_factor /= (factorial(input_species.count(s))
+                                    * factorial(output_species.count(s)))
         self.process_configs[name] = {
             'input': input_species,
             'output': output_species,
-            'matrix_element': matrix_element,
-            'coupling': coupling,
+            'matrix_element_squared': matrix_element_squared,
+            'symmetry_factor': float(symmetry_factor),
             'n_in': len(input_species),
             'n_out': len(output_species),
             'n_total': len(input_species) + len(output_species),
@@ -423,7 +446,8 @@ class BEST:
                 self.species_mass[species] = 0.0
         if self.world_rank == 0:
             print(f"Added process {name}: {input_species} -> {output_species} "
-                  f"(neval={neval}, nitn={nitn}, delta_width={delta_width})")
+                  f"(neval={neval}, nitn={nitn}, delta_width={delta_width}, "
+                  f"symmetry_factor={symmetry_factor:g})")
 
     def set_species(self, name, stat='boson', mass=0.0, dof=1):
         """Set species statistics and mass."""
@@ -440,7 +464,22 @@ class BEST:
     def initialize_species(self, species, init_func, grid='log',
                            stat='boson', mass=0.0, dof=None):
         """Initialize species distribution on a fixed grid.
-        grid: 'log' or 'linear'."""
+        grid: 'log' or 'linear'.
+        init_func: a callable f(q), a pair of arrays (q_tab, f_tab), or the path of
+        a two-column text file 'q f' ('#' comments; comma-separated if .csv), with
+        q comoving at a0. Tabulated input is interpolated with the solver's own
+        extrapolating interpolator. An all-zero distribution is seeded from its
+        production spectrum at the first evolve_step."""
+        if isinstance(init_func, str):
+            init_func = tuple(np.loadtxt(init_func, comments='#',
+                                         delimiter=',' if init_func.endswith('.csv') else None).T[:2])
+        if not callable(init_func):
+            q_tab, f_tab = (np.asarray(x, float) for x in init_func)
+            if f_tab.max() <= 0.0:              # empty table: exact floor, seeded at the first step
+                init_func = lambda q: self.f_floor
+            else:
+                init_func = ExtrapolatingInterp(q_tab, np.clip(f_tab, self.f_floor, None), mass=mass,
+                                                stat=stat, a=self.scale_factor(self.current_time))
         if dof is None:
             dof = 2 if stat == 'fermion' else 1
         self.species_dof = getattr(self, 'species_dof', {})
@@ -456,8 +495,10 @@ class BEST:
             self.r_grids[species] = np.linspace(
                 self.q_min, self.q_max, self.n_grid)
 
-        f_values = np.array([init_func(r) for r in self.r_grids[species]])
+        f_values = np.maximum(np.array([init_func(r) for r in self.r_grids[species]]), self.f_floor)
         self.distributions_1d[species] = f_values
+        if np.max(f_values) <= self.f_floor:
+            self._empty_species.add(species)
         self.interpolators[species] = ExtrapolatingInterp(
             self.r_grids[species], f_values,
             mass=self.species_mass.get(species, 0.0),
@@ -566,8 +607,8 @@ class BEST:
 
         stats = [self.species_config[s] for s in all_species]
         interps = {s: self.interpolators[s] for s in set(all_species)}
-        matrix_element = config['matrix_element']
-        coupling = config['coupling']
+        matrix_element_squared = config['matrix_element_squared']
+        symmetry_factor = config['symmetry_factor']
         pi_power = (2 * np.pi) ** (3 * (n_total - 1) - 4)
         cutoff_e = self.cutoff_energy_min
         vegas_mod = self._vegas
@@ -703,7 +744,7 @@ class BEST:
                         FW *= (1 - f_arr[k])
 
             momenta_batch = np.stack([mom_x, mom_y, mom_z], axis=1)
-            M_sq = matrix_element(momenta_batch, coupling)
+            M_sq = matrix_element_squared(momenta_batch) * symmetry_factor
             common = sign * delta_f * phase * M_sq
 
             bad = np.zeros(N, dtype=bool)
@@ -789,16 +830,20 @@ class BEST:
                     self.adaptive_widths[key][r_index]['forward'] = dw / 1.25
 
             # ---- quality control ----
-            if result_f.mean == 0:
+            # A point is neglected only when both directions vanish. FW alone can be
+            # exactly zero for an empty species in the input slot (f1 f2 underflows)
+            # while the gain (BW) is finite: that gain must be kept.
+            if result_f.mean == 0 and result_b.mean == 0:
                 self.error_stats['neglected'] += 1
                 continue
-            rel_f = result_f.sdev / abs(result_f.mean)
-            self.error_stats.setdefault('rel_errs', []).append(rel_f)
-            if rel_f > 1.0:
-                self.error_stats['dropped'] += 1
-                if self.world_rank == 0:
-                    print(f"      [drop] {key} r_index={r_index} rel_err_f={rel_f:.2f}")
-                continue
+            if result_f.mean != 0:
+                rel_f = result_f.sdev / abs(result_f.mean)
+                self.error_stats.setdefault('rel_errs', []).append(rel_f)
+                if rel_f > 1.0:
+                    self.error_stats['dropped'] += 1
+                    if self.world_rank == 0:
+                        print(f"      [drop] {key} r_index={r_index} rel_err_f={rel_f:.2f}")
+                    continue
 
             rel_b = result_b.sdev / abs(result_b.mean) if result_b.mean != 0 else np.inf
             if rel_b > 1.0:
@@ -1022,9 +1067,24 @@ class BEST:
     # Rate computation (Analytical, 2->2 only)
     # ------------------------------------------------------------------
     def _compute_rates_all_species(self, process_name, n_F, M_squared=None):
+        """M_squared: None reads the constant bare |M|^2 off the process' function;
+        a number or a callable M_squared(t) uses that bare |M|^2 instead. The
+        symmetry factor for identical particles is applied here in every case, as in the Vegas
+        path."""
         config = self.process_configs[process_name]
+        sym = config['symmetry_factor']
         if M_squared is None:
-            M_squared = config['coupling'] ** 2
+            probe = np.random.default_rng(0).normal(size=(config['n_total'], 3, 2))
+            vals = np.asarray(config['matrix_element_squared'](probe), float)
+            if vals.shape != (2,) or not np.allclose(vals, vals[0]):
+                raise ValueError(f"{process_name}: the analytical 2->2 method with "
+                                 "M_squared=None requires a constant |M|^2")
+            M_squared = float(vals[0]) * sym
+        elif callable(M_squared):
+            M_bare = M_squared
+            M_squared = lambda t: M_bare(t) * sym
+        else:
+            M_squared = float(M_squared) * sym
         input_species = config['input']
         output_species = config['output']
         species_rates = {}
@@ -1089,10 +1149,38 @@ class BEST:
     # ------------------------------------------------------------------
     # Time stepping (Vegas)
     # ------------------------------------------------------------------
+    def _seed_from_production(self, species):
+        """Start an all-zero distribution from its production spectrum:
+        f = f_seed * G(q)/max G, with G the net rate at f = 0 (pure gain, since
+        the loss is proportional to f). The amplitude f_seed is arbitrary as
+        long as it is negligible; results must not depend on it (check by
+        changing it). COLLECTIVE: called by all ranks; rank 0 holds the result,
+        which evolve_step broadcasts."""
+        procs = [p for p, c in self.process_configs.items()
+                 if species in c['input'] + c['output']]
+        rates, _, _ = self._compute_rates_vegas(procs, t=self.current_time)
+        if self.world_rank == 0:
+            G = np.clip(np.asarray(rates[species], float), 0.0, None)
+            if G.max() <= 0.0:
+                print(f"Species {species}: no production, left empty")
+                return
+            self.distributions_1d[species] = self.f_seed * G / G.max()
+            self.interpolators[species] = ExtrapolatingInterp(
+                self.r_grids[species], self.distributions_1d[species],
+                mass=self.species_mass.get(species, 0.0),
+                stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time))
+            print(f"Species {species}: all-zero distribution seeded from its production "
+                  f"spectrum (f_seed = {self.f_seed:g})")
+
     def evolve_step(self, dt, active_processes=None,
                     adapt_dt=True, method='heun'):
         if active_processes is None:
             active_processes = list(self.process_configs.keys())
+        # Species initialized empty are seeded once from their production spectrum
+        # (collective: every rank runs the rate pass).
+        for s in [s for s in self.species_list if s in self._empty_species]:
+            self._seed_from_production(s)
+            self._empty_species.discard(s)
         t_step_start = time.time()
         self.error_stats = {'dropped': 0, 'neglected': 0, 'rel_errs': []}
 
@@ -1430,8 +1518,8 @@ class BEST:
     def init_history(self):
         """Initialize history dict for all registered species.
 
-        Returns a dict with keys 'times' and one sub-dict per species,
-        each containing lists for 'f', 'n', 'e'.
+        Returns a dict with keys 'times' and 'a' and one sub-dict per species,
+        each containing lists for 'f', 'n', 'e', 'm'.
         The initial state (t = current_time) is recorded automatically.
 
         Usage:
@@ -1523,7 +1611,8 @@ class BEST:
         group leader's dicts to rank 0 and merge before pickling."""
         contrib = None
         if self.sub_rank == 0:
-            maps = {pk: {k: getattr(integ, 'map', integ) for k, integ in d.items()}
+            maps = {pk: {k: (integ.map if isinstance(integ, self._vegas.Integrator) else integ)
+                         for k, integ in d.items()}
                     for pk, d in self.vegas_integrators.items()}
             contrib = (self.color, maps, self.adaptive_widths)
         gathered = self.world_comm.gather(contrib, root=0)
@@ -1534,8 +1623,8 @@ class BEST:
         process_configs_ser = {}
         for name, config in self.process_configs.items():
             cc = config.copy()
-            cc['matrix_element_name'] = config['matrix_element'].__name__
-            del cc['matrix_element']
+            cc['matrix_element_squared_name'] = getattr(config['matrix_element_squared'], '__name__', None)
+            del cc['matrix_element_squared']
             process_configs_ser[name] = cc
 
         state = {
@@ -1560,9 +1649,10 @@ class BEST:
             pickle.dump(state, fh)
         print(f"Checkpoint saved: {filename}")
 
-    def load_checkpoint(self, filename, matrix_elements=None):
+    def load_checkpoint(self, filename, matrix_elements_squared=None):
         """Load checkpoint. COLLECTIVE: must be called by ALL ranks together.
-        Pass matrix_elements={'name': func} to restore matrix elements.
+        Pass matrix_elements_squared={'process or function name': func} to restore
+        the |M|^2 functions (needed for lambdas, closures and partials).
 
         Memory: the heavy payload (per-group vegas integrators; ~MB each,
         x groups x processes x 2 directions) is NOT broadcast. Rank 0 pops it
@@ -1634,29 +1724,25 @@ class BEST:
         hi = lo + block + (1 if self.color < rem else 0)
         self.adaptive_widths = {k: {ri: v for ri, v in d.items() if lo <= ri < hi}
                                 for k, d in w_all.items()}
-        # Lookup for matrix element restoration:
-        # 1) user-provided dict, 2) caller's globals, 3) best.py globals
+        # Matrix-element restoration: matrix_elements_squared may be keyed by the
+        # process name or by the function name; then the caller's globals.
         import inspect
         caller_globals = inspect.stack()[1][0].f_globals
-        me_lookup = matrix_elements or {}
+        me_lookup = matrix_elements_squared or {}
 
         self.process_configs = {}
         for name, config in state['process_configs'].items():
             cc = config.copy()
-            func_name = cc.get('matrix_element_name')
-            func = (me_lookup.get(func_name)
-                    or caller_globals.get(func_name)
-                    or globals().get(func_name))
-            if func:
-                cc['matrix_element'] = func
-                del cc['matrix_element_name']
-                self.process_configs[name] = cc
-                if self.world_rank == 0:
-                    print(f"  Restored process: {name}")
-            else:
-                if self.world_rank == 0:
-                    print(f"  Warning: Could not restore {name} "
-                          f"(function '{func_name}' not found)")
+            func_name = cc.pop('matrix_element_squared_name', None)
+            func = (me_lookup.get(name) or me_lookup.get(func_name)
+                    or (caller_globals.get(func_name) if func_name else None))
+            if func is None:
+                raise ValueError(f"cannot restore process '{name}': pass its |M|^2 function in "
+                                 f"matrix_elements_squared={{'{name}': func}}")
+            cc['matrix_element_squared'] = func
+            self.process_configs[name] = cc
+            if self.world_rank == 0:
+                print(f"  Restored process: {name}")
 
         if not self.r_grids:
             for species in self.species_list:

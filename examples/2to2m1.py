@@ -1,30 +1,16 @@
 """
 BEST-hep example: thermalization via 2<->2 elastic scattering (massive).
+
 Run: mpirun -np 8 python examples/2to2m1.py
 
-Convention for `coupling` and `matrix_element`
-----------------------------------------------
-BEST knows nothing about Lagrangians. The solver sees |M|^2 only through the
-user-supplied `matrix_element` function and assumes that |M|^2 ALREADY
-INCLUDES all identical-particle symmetry factors (Kolb & Turner convention).
-The leg multiplicities are applied by the code itself,
-    C = n_alpha * C_alpha + n_beta * C_beta   (e.g. C = 2*C_2 + 3*C_3 for 2<->3).
-
-`coupling` is just a number handed to `matrix_element`; its physical meaning is
-fixed by how you write that function. In this example `matrix_element` returns
-coupling**2 with no symmetry factor, so `coupling` is an effective parameter:
-for L = -(lam/4!) phi^4 it corresponds to lam/2, and coupling = 1.0 (as used
-for the figures in the paper) means lam = 2.
-
-If you want `coupling` to be the Lagrangian coupling itself, put the symmetry
-factor inside `matrix_element`: divide the Feynman-rule |M|^2 by k! for every
-species appearing k times on a given side of the reaction, on BOTH sides:
-
-    L = -(lam /4!) phi^4,  phi phi <-> phi phi      :  return coupling**2 / (2*2)   # 2!*2!
-    L = -(lam5/5!) phi^5,  phi phi <-> phi phi phi  :  return coupling**2 / (2*6)   # 2!*3!
-
-The factor is symmetric between the two sides, which is why one `matrix_element`
-serves the gain and loss terms and both C_2 and C_3.
+Matrix-element convention
+-------------------------
+`matrix_element_squared(momenta)` returns the bare |M|^2 of the Feynman rules,
+couplings included, without symmetry factors: |M|^2 = lam^2 for
+L = -(lam/4!) phi^4. The solver applies the symmetry factor for identical
+particles, 1/(prod_s n_in,s! prod_s n_out,s!) (1/4 here), and the leg multiplicities itself:
+add_process(..., symmetry_factor='auto') is the default. If your |M|^2 already
+contains the factor, pass symmetry_factor=1.0 instead.
 """
 import numpy as np
 import sys, os
@@ -35,11 +21,11 @@ from besthep import BEST
 # ======================================================================
 # Matrix element
 # ======================================================================
-def matrix_element(momenta, coupling):
-    """Constant |M|^2 = coupling**2; symmetry factors absorbed into coupling (see module docstring)."""
-    # If coupling is the Lagrangian coupling lam of L = -(lam/4!) phi^4, use instead:
-    # return np.full(momenta.shape[2], coupling**2 / (2*2))   # 2!*2!
-    return np.full(momenta.shape[2], coupling**2)
+lam = 1.0   # quartic coupling, L = -(lam/4!) phi^4
+
+def matrix_element_squared(momenta):
+    """Constant bare |M|^2 = lam^2, one value per batch point."""
+    return np.full(momenta.shape[2], lam**2)
 
 
 # ======================================================================
@@ -57,7 +43,6 @@ q_min    = 0.1      # momentum grid lower bound
 q_max    = 50.0     # momentum grid upper bound
 n_grid   = 40       # number of momentum grid points
 mass     = 1.0      # phi mass
-coupling = 1.0      # see docstring
 neval    = int(1e6) # Vegas evaluations
 dt       = 1e2      # base time step
 n_steps  = 20       # number of evolution steps
@@ -75,13 +60,12 @@ resume = solver.world_comm.bcast(resume, root=0)
 if resume:
     history = solver.load_checkpoint(
         checkpoint_file,
-        matrix_elements={'matrix_element': matrix_element})
+        matrix_elements_squared={'2to2': matrix_element_squared})
 else:
     solver.initialize_species('phi', init_f, stat='boson', mass=mass)
     solver.add_process('2to2',
                        ['phi', 'phi'], ['phi', 'phi'],
-                       matrix_element, coupling=coupling,
-                       neval=neval)
+                       matrix_element_squared, neval=neval)
 
     history = solver.init_history()
 

@@ -6,11 +6,10 @@ everywhere -- cosmology and entropy. No dof table anywhere in this pipeline;
 post-processing must use the SAME constant (do NOT run the Drees-table plot
 script on this checkpoint).
 
-Channels (same contact vertex, lambda = 1):
-    ann  phi1 phi1 -> phi2 phi2 : |M|^2 = lambda^2/4   (1/(2!*2!) folded in
-                                  here; besthep supplies slot multiplicity)
-    el   phi1 phi2 -> phi1 phi2 : |M|^2 = lambda^2     (no identical legs)
-
+Channels (same contact vertex, lambda = 1), bare |M|^2 = lambda^2 for both:
+    ann  phi1 phi1 -> phi2 phi2   (the solver applies 1/(2!*2!) for the
+                                   identical pairs and the slot multiplicity)
+    el   phi1 phi2 -> phi1 phi2   (no identical legs: factor 1)
 
 All outputs live in the checkpoint (history included); post-processing reads
 the checkpoint. Delete any old checkpoint.pkl before a fresh run (resume
@@ -31,7 +30,7 @@ coupling = 1.0                 # = lambda
 # --------------------------- cosmology (CONST dof) --------------------------
 m1_phys, M_Pl_red_phys = 100.0, 2.435e18       # GeV
 a0      = 1.0
-x_stop  = 40.0              
+x_stop  = 40.0
 HEFF    = 10.2**2              # = geff = 104.04 ;
 SQGEFF  = 10.2
 
@@ -56,13 +55,11 @@ max_rel_err, min_rel_err, max_rel_change = 0.01, 0.001, 0.3
 checkpoint_file = "checkpoint.pkl"
 
 # --------------------------- physics ---------------------------------------
-def matrix_element(momenta, coupling):
-    # ann: |M|^2 = lambda^2 * 1/(2!*2!) -- identical pairs on both sides
-    return np.full(momenta.shape[2], coupling**2 / 4.0)
+def matrix_element_ann(momenta):
+    return np.full(momenta.shape[2], coupling**2)        # bare |M|^2 = lambda^2
 
-def matrix_element_el(momenta, coupling):
-    # el: |M|^2 = lambda^2 -- no identical legs, NO /4
-    return np.full(momenta.shape[2], coupling**2)
+def matrix_element_el(momenta):
+    return np.full(momenta.shape[2], coupling**2)        # bare |M|^2 = lambda^2
 
 def be_on_grid(q_grid, mass, T, a, mu=0.0):
     p = np.asarray(q_grid, float) / a
@@ -103,17 +100,17 @@ resume = solver.world_comm.bcast(resume, root=0)
 if resume:
     history = solver.load_checkpoint(
         checkpoint_file,
-        matrix_elements={'matrix_element': matrix_element,
-                         'matrix_element_el': matrix_element_el})
+        matrix_elements_squared={'ann': matrix_element_ann,
+                                 'el': matrix_element_el})
     solver.scale_factor = scale_factor      # not checkpointed
 else:
     solver.initialize_species('phi1', init_phi1, stat='boson', mass=m1)
     solver.initialize_species('phi2', init_phi2, stat='boson', mass=m2)
     solver.add_process('el', ['phi1', 'phi2'], ['phi1', 'phi2'],
-                       matrix_element_el, coupling=coupling,
+                       matrix_element_el,
                        neval=neval, delta_width=delta_width, nitn=2)
     solver.add_process('ann', ['phi1', 'phi1'], ['phi2', 'phi2'],
-                       matrix_element, coupling=coupling,
+                       matrix_element_ann,
                        neval=neval, delta_width=delta_width, nitn=2)
     solver.current_time = t0
     history = solver.init_history()

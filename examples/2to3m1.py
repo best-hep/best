@@ -2,6 +2,16 @@
 BEST-hep example: thermalization via 2<->3 cannibal process.
 
 Run: mpirun -np 272 python 2to3m1.py
+
+Matrix-element convention
+-------------------------
+`matrix_element_squared(momenta)` returns the bare |M|^2 of the Feynman rules,
+couplings included, without symmetry factors: |M|^2 = lam5^2 for
+L = -(lam5/5!) phi^5. The solver applies the symmetry factor for identical
+particles, 1/(prod_s n_in,s! prod_s n_out,s!) (1/(2! 3!) = 1/12 here), and the leg
+multiplicities (C = 2 C_2 + 3 C_3) itself: add_process(..., symmetry_factor='auto')
+is the default. If your |M|^2 already contains the factor, pass
+symmetry_factor=1.0 instead.
 """
 import numpy as np
 import sys, os
@@ -11,11 +21,11 @@ from besthep import BEST
 # ======================================================================
 # Matrix element
 # ======================================================================
-def matrix_element(momenta, coupling):
-    """Constant |M|^2. Symmetry factors included in coupling."""
-    # If coupling is the Lagrangian coupling lam5 of L = -(lam5/5!) phi^5, use instead:
-    # return np.full(momenta.shape[2], coupling**2 / (2*6))   # 2!*3!
-    return np.full(momenta.shape[2], coupling**2)
+lam5 = 1.0   # quintic coupling, L = -(lam5/5!) phi^5
+
+def matrix_element_squared(momenta):
+    """Constant bare |M|^2 = lam5^2, one value per batch point."""
+    return np.full(momenta.shape[2], lam5**2)
 
 # ======================================================================
 # Initial condition
@@ -31,7 +41,6 @@ q_min    = 0.1
 q_max    = 50.0
 n_grid   = 68*2
 mass     = 1.0
-coupling = 1.0
 neval    = int(1e7)
 dt       = 1e5
 n_steps  = 3000
@@ -48,13 +57,12 @@ resume = solver.world_comm.bcast(resume, root=0)
 if resume:
     history = solver.load_checkpoint(
         checkpoint_file,
-        matrix_elements={'matrix_element': matrix_element})
+        matrix_elements_squared={'2to3': matrix_element_squared})
 else:
     solver.initialize_species('phi', init_f, stat='boson', mass=mass)
     solver.add_process('2to3',
                        ['phi', 'phi'], ['phi', 'phi', 'phi'],
-                       matrix_element, coupling=coupling,
-                       neval=neval)
+                       matrix_element_squared, neval=neval)
 
     history = solver.init_history()
 

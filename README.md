@@ -71,9 +71,11 @@ from besthep import BEST
 # ======================================================================
 # Matrix element
 # ======================================================================
-def matrix_element(momenta, coupling):
-    """Constant |M|^2 = coupling**2; symmetry factors absorbed into coupling (see examples/2to2m1.py)."""
-    return np.full(momenta.shape[2], coupling**2)
+lam = 1.0   # L = -(lam/4!) phi^4
+
+def matrix_element_squared(momenta):
+    """Bare |M|^2 = lam^2; the symmetry factor for identical particles is applied by the solver."""
+    return np.full(momenta.shape[2], lam**2)
 
 
 # ======================================================================
@@ -91,7 +93,6 @@ q_min    = 0.1
 q_max    = 50.0
 n_grid   = 40
 mass     = 1.0
-coupling = 1.0
 neval    = int(1e6)
 dt       = 1e2
 n_steps  = 20
@@ -109,13 +110,12 @@ resume = solver.world_comm.bcast(resume, root=0)
 if resume:
     history = solver.load_checkpoint(
         checkpoint_file,
-        matrix_elements={'matrix_element': matrix_element})
+        matrix_elements_squared={'2to2': matrix_element_squared})
 else:
     solver.initialize_species('phi', init_f, stat='boson', mass=mass)
     solver.add_process('2to2',
                        ['phi', 'phi'], ['phi', 'phi'],
-                       matrix_element, coupling=coupling,
-                       neval=neval)
+                       matrix_element_squared, neval=neval)
 
     history = solver.init_history()
 
@@ -141,6 +141,22 @@ Run with MPI:
 ```bash
 mpirun -np 8 python3 examples/2to2m1.py
 ```
+
+`matrix_element_squared(momenta)` returns the bare |M|² of the Feynman rules,
+couplings included, one value per Vegas batch point (`momenta` has shape
+(n_particles, 3, N); see `examples/propagator.py` for momentum-dependent
+amplitudes). This is the standard convention of particle physics: |M|² is the
+squared amplitude with the couplings of the Lagrangian, and the
+symmetry factors for identical particles belong to the phase space. The solver applies that
+factor, 1/(∏ n_in,s! ∏ n_out,s!), and the leg multiplicities itself
+(`add_process(..., symmetry_factor='auto')`, the default); pass
+`symmetry_factor=1.0` if your |M|² already contains the factor.
+
+`initialize_species` also accepts a `(q, f)` pair of arrays or a two-column
+text file (`q f`, comoving q at a₀). A species initialized at zero is seeded
+from its production spectrum at the first step (`solver.f_seed`, default
+1e-10), so freeze-in runs can start from an empty species.
+
 ### Plotting the results
 
 ```bash
@@ -158,7 +174,7 @@ per-step f and moments for custom analysis.
 ```python
 solver.add_process('cannibal',
     ['phi', 'phi'], ['phi', 'phi', 'phi'],
-    matrix_element, coupling=1.0, neval=int(1e7), delta_width=0.01)
+    matrix_element_squared, neval=int(1e7), delta_width=0.01)
 ```
 
 The identical-particle decomposition (*C* = 2*C*₂ + 3*C*₃) is handled automatically.
@@ -204,7 +220,7 @@ solver.initialize_species('chi', init_chi, stat='fermion', mass=5.0)
 solver.initialize_species('phi', init_phi, stat='boson', mass=1.0)
 solver.add_process('annihilation',
     ['chi', 'chi'], ['phi', 'phi'],
-    matrix_element_ann, coupling=0.1, neval=int(1e6))
+    matrix_element_ann, neval=int(1e6))
 ```
 
 ### Time-dependent masses
@@ -218,16 +234,41 @@ solver.set_mass_func('phi', lambda t: 1.0 if t > 20 else 0.0)
 ```python
 solver.save_checkpoint('checkpoint.pkl', history=history)
 history = solver.load_checkpoint('checkpoint.pkl',
-    matrix_elements={'matrix_element': matrix_element})
+    matrix_elements_squared={'2to2': matrix_element_squared})
 ```
 
 `save_checkpoint` is **collective**: call it from all MPI ranks (as in the
 examples above). The checkpoint stores the adapted Vegas integrator state of
 every MPI group, so resumed runs continue seamlessly; resuming with a
 different number of momentum groups discards the integrator maps with a
-warning and re-adapts.
+warning and re-adapts. The keys of `matrix_elements_squared` are process
+names (or function names); lambdas and closures are restored by process name.
 
 ## Changelog
+
+### v1.2.8
+- Matrix elements: `matrix_element_squared(momenta)` returns the bare |M|^2 with
+  the couplings inside; the `coupling` argument of `add_process` is gone. The
+  symmetry factor for identical particles, 1/(prod n_in,s! prod n_out,s!), is applied by the
+  solver (`symmetry_factor='auto'`, the default; a number overrides it). This
+  is the standard convention of particle physics: |M|^2 is the squared Feynman
+  amplitude with the couplings of the Lagrangian (lam^2 for
+  L = -(lam/4!) phi^4), and the symmetry factors belong to the phase
+  space, where the solver puts them. Not compatible with earlier
+  matrix-element functions or checkpoints;
+  `load_checkpoint(..., matrix_elements_squared={process name: func})`.
+  The examples use lam = 1 (lam5 = 1); the paper's figures correspond to
+  lam = 2 and lam5 = sqrt(12) in this convention.
+- `initialize_species` accepts a tabulated spectrum, `(q, f)` arrays or a
+  two-column text file; a species initialized at zero is seeded from its
+  production spectrum at the first step (`f_seed`), so freeze-in runs start
+  from an empty species.
+- Rate quality control: a grid point is skipped only when both directions
+  vanish; an empty species in the input slot previously lost its gain.
+- Checkpoint: integrator maps restored but not yet re-wrapped were saved as
+  their `map()` method (crash on the next resume when a backward fallback
+  fired); fixed. A process that cannot be restored is an error, not a warning.
+- `n_r_parallel` must divide the number of MPI ranks (was an IndexError later).
 
 ### v1.2.7
 - History records each species' mass per snapshot (time-dependent masses).
@@ -262,7 +303,9 @@ warning and re-adapts.
 - `exprb_seq`: stiffness ordering now uses the f-weighted bulk loss rate
   per process (previously the per-mode maximum); mid-step interpolator
   rebuilds use a(t), the final one a(t+dt).
-- `2to2m1.py`: docstring documents the `coupling`/`matrix_element` convention (symmetry factors assumed included in |M|²).
+- ~~`2to2m1.py`: docstring documents the `coupling`/`matrix_element` convention
+  (symmetry factors assumed included in |M|²).~~ *(superseded in v1.2.8: the
+  solver applies the symmetry factor itself)*
 
 ### v1.2.2
 

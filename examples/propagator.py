@@ -1,5 +1,7 @@
 """
-BESThep example: momentum-dependent matrix elements.
+BEST-hep example: momentum-dependent matrix elements.
+
+Run: mpirun -np 8 python propagator.py
 
 This example shows how to write a |M|^2 that depends on the particle
 momenta, using s-channel and t-channel Breit-Wigner propagators as
@@ -11,9 +13,12 @@ The `momenta` argument passed to a matrix-element function
 ----------------------------------------------------------------------
 A matrix-element function has the signature
 
-    def matrix_element(momenta, coupling) -> array of shape (N,)
+    def matrix_element_squared(momenta) -> array of shape (N,)
 
-where `momenta` is a NumPy array of shape
+and returns the bare |M|^2, couplings included; the identical-particle
+factor (1/(2! 2!) for phi phi -> phi phi) is applied by the solver
+(add_process default symmetry_factor='auto'). `momenta` is a NumPy array
+of shape
 
     (n_total, 3, N)
        |       |   |
@@ -38,8 +43,6 @@ Only 3-momenta are provided; the energy is reconstructed on-shell as
 E_i = sqrt(|p_i|^2 + m_i^2) using the known particle mass. The return
 value must be an array of length N (the squared amplitude at each
 sample point).
-
-Run: mpirun -np 4 python propagator.py
 """
 import sys
 import os
@@ -55,12 +58,13 @@ from besthep import BEST
 M_PHI = 1.0     # mass of the external phi
 M_MED = 5.0     # mass of the (virtual) mediator in the propagator
 GAMMA = 1.0     # mediator width (regularizes the resonance)
+coupling = 1.0  # coupling g at the mediator vertex
 
 
 # ======================================================================
 # Matrix elements
 # ======================================================================
-def matrix_element_schannel(momenta, coupling):
+def matrix_element_schannel(momenta):
     """s-channel Breit-Wigner: |M|^2 = g^2 / ((s - M^2)^2 + (Gamma M)^2).
 
     s = (p1 + p2)^2 is built from the two INITIAL-state momenta,
@@ -78,7 +82,7 @@ def matrix_element_schannel(momenta, coupling):
     return coupling**2 / ((s - M_MED**2)**2 + (GAMMA * M_MED)**2)
 
 
-def matrix_element_tchannel(momenta, coupling):
+def matrix_element_tchannel(momenta):
     """t-channel Breit-Wigner: |M|^2 = g^2 / ((t - M^2)^2 + (Gamma M)^2).
 
     t = (p1 - p3)^2 is built from one INITIAL (momenta[0]) and one
@@ -109,14 +113,14 @@ def init_f(r, r0=3.0, width=2.0):
 # Setup
 # ======================================================================
 # Choose which propagator to use by swapping the function below.
-# matrix_element = matrix_element_schannel
-matrix_element = matrix_element_tchannel
+# matrix_element_squared = matrix_element_schannel
+matrix_element_squared = matrix_element_tchannel
 
 solver = BEST(q_min=0.1, q_max=50.0, n_grid=40)
 solver.initialize_species('phi', init_f, stat='boson', mass=M_PHI)
 solver.add_process('scatter',
                    ['phi', 'phi'], ['phi', 'phi'],
-                   matrix_element, coupling=1.0,
+                   matrix_element_squared,
                    neval=int(1e5))
 
 history = solver.init_history()
