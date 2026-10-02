@@ -266,6 +266,9 @@ class BEST:
     cutoff_energy_min = 1e-50
     f_floor = 1e-300        # occupation floor applied to every initial distribution: log interpolation, all-zero detection
     f_seed = 1e-10        # amplitude of the production-spectrum seed for all-zero species
+    rate_flush = 1e-150     # rate-density values below this are set to 0 before vegas: their
+                            # variance underflows (x^2 < 2.2e-308, i.e. |x| < sqrt(tiny) ~ 1.5e-154)
+                            # and the weighted average of the joint columns divides by it
     verbose = False         # dev/debug output
     bw_fallback_rel_err = 0.3
     def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3, adapt_width=False, max_rel_err=0.1, min_rel_err=0.0001):
@@ -615,6 +618,7 @@ class BEST:
         symmetry_factor = config['symmetry_factor']
         pi_power = (2 * np.pi) ** (3 * (n_total - 1) - 4)
         cutoff_e = self.cutoff_energy_min
+        rate_flush = self.rate_flush
         vegas_mod = self._vegas
         a = self.scale_factor(t)
         masses = [self.species_mass.get(s, 0.0) for s in all_species]
@@ -705,14 +709,20 @@ class BEST:
 
             eff_width = delta_width * K_tot                            # sigma_E = delta * K_tot
             norm_d = 1.0 / (eff_width * np.sqrt(2 * np.pi))
-            delta_f = norm_d * np.exp(-dE**2 / (2 * eff_width**2))
-            delta_f[np.abs(dE) > K_tot] = 0.0                          # no proportional projection; weight ~ exp(-1/(2 delta^2)), cut is lossless
+            valid = np.abs(dE) <= K_tot                                # |lam| <= 1: proportional projection exists
+            delta_f = np.where(valid, norm_d * np.exp(-dE**2 / (2 * eff_width**2)), 0.0)
+            # (invalid: weight ~ exp(-1/(2 delta^2)), the cut is lossless)
 
-            # Phase space: 1 / prod(2E) at the projected energies
+            # Phase space: 1 / prod(2E) at the projected energies, on the valid
+            # samples only. Off them a massless leg can be projected to E_p = 0
+            # (K_p clipped), and jacobian / prod_2E overflows to inf, whose
+            # product with the zero weight is NaN.
             prod_2E = np.ones(N)
             for k in range(n_total):
                 prod_2E *= 2.0 * E_p[k]
-            phase = g_factor * jacobian / (np.maximum(prod_2E, 1e-300) * pi_power)
+            phase = np.zeros(N)
+            phase[valid] = (g_factor * jacobian[valid]
+                            / (np.maximum(prod_2E[valid], 1e-300) * pi_power))
 
             # Distribution functions at the projected comoving momenta
             f_arr = []
@@ -754,20 +764,28 @@ class BEST:
                 bad |= (energies[k] < cutoff_e)
             common[bad] = 0.0
 
+            # An empty species (f = f_floor) alone in an input slot leaves FW at
+            # ~1e-304 instead of underflowing to 0 as a product of two floors
+            # does; such columns break vegas (see rate_flush). Flush them to an
+            # exact zero, which the quality control already handles.
+            def _flush(x):
+                x[np.abs(x) < rate_flush] = 0.0
+                return x
+
             if mode == 'joint':
                 # Same sample for FW and BW (lbatch: batch index first).
                 # vegas adapts to column 0 = FW+BW, which covers both peaks;
                 # columns 1, 2 are the estimates actually used.
                 out = np.empty((N, 3))
-                out[:, 0] = (FW + BW) * common
-                out[:, 1] = FW * common
-                out[:, 2] = BW * common
+                out[:, 0] = _flush((FW + BW) * common)
+                out[:, 1] = _flush(FW * common)
+                out[:, 2] = _flush(BW * common)
                 return out
             if mode == 'forward':
-                return FW * common
+                return _flush(FW * common)
             if mode == 'backward':
-                return BW * common
-            return (BW - FW) * common
+                return _flush(BW * common)
+            return _flush((BW - FW) * common)
 
         return integrand
 
@@ -892,7 +910,8 @@ class BEST:
                 stat = self.species_config[species]
                 mass = self.species_mass.get(species, 0.0)
                 print(f"\n  Computing C[f] for {species} "
-                      f"({stat}, m={mass}, a={self.scale_factor(t):.4f}):")
+                      f"({stat}, m={mass}, a={self.scale_factor(t):.4f}) "
+                      f"via {', '.join(active_processes)}:")
                 print(f"    Grid points: {len(self.r_grids[species])}", flush=True)
 
             n_r = len(self.r_grids[species])

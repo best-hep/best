@@ -259,6 +259,11 @@ names (or function names); lambdas and closures are restored by process name.
   averaged over all states. Species with dof = 1 are unchanged; user
   matrix elements for fermions or other multi-state species give different
   numbers than in v1.2.8. `initialize_species(..., dof=...)` documented.
+- Integrand: samples with a massless leg projected to zero energy no longer
+  produce inf (the phase-space factor is evaluated on valid samples only), and
+  rate-density values below `rate_flush` = 1e-150 are set to zero so that
+  Vegas never divides by an underflowed variance. Both affected only 1 -> 2
+  decays and massless legs at large q; other results are unchanged.
 
 ### v1.2.8
 - Matrix elements: `matrix_element_squared(momenta)` returns the bare |M|^2 with
