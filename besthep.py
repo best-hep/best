@@ -412,8 +412,10 @@ class BEST:
         """Register a process.
 
         matrix_element_squared(momenta): the bare |M|^2 with the couplings inside,
-        summed/averaged over degrees of freedom, without identical-particle
-        factors. momenta has shape (n_particles, 3, batch): the 3-momenta
+        summed over the internal states (spins, colours, ...) of EVERY particle,
+        initial and final -- e.g. 2 y^2 (m_phi^2 - 4 m_psi^2) for phi -> psi psibar;
+        the solver divides by the observed species' dof. No symmetry factors.
+        momenta has shape (n_particles, 3, batch): the 3-momenta
         (px, py, pz) of the particles in the order input + output, for a batch
         of Vegas points; return one value per batch point (energies are on
         shell, E = sqrt(p^2 + m^2)).
@@ -469,7 +471,9 @@ class BEST:
         a two-column text file 'q f' ('#' comments; comma-separated if .csv), with
         q comoving at a0. Tabulated input is interpolated with the solver's own
         extrapolating interpolator. An all-zero distribution is seeded from its
-        production spectrum at the first evolve_step."""
+        production spectrum at the first evolve_step.
+        dof: internal degrees of freedom (default 2 for a fermion, 1 for a boson;
+        give it explicitly for a complex scalar, a vector, ...)."""
         if isinstance(init_func, str):
             init_func = tuple(np.loadtxt(init_func, comments='#',
                                          delimiter=',' if init_func.endswith('.csv') else None).T[:2])
@@ -614,13 +618,11 @@ class BEST:
         vegas_mod = self._vegas
         a = self.scale_factor(t)
         masses = [self.species_mass.get(s, 0.0) for s in all_species]
-        # partner-leg internal dof (every leg except the observed/target one);
-        # the target's own g is applied at the moment level in compute_moments.
+        # |M|^2 is summed over the internal states of every leg; the rate of one
+        # state of the observed species is that sum divided by its own g. The
+        # target's g enters again only in the moments (n = g int f).
         _dof = getattr(self, 'species_dof', {})
-        g_factor = 1.0
-        for _l in range(n_total):
-            if _l != target_idx:
-                g_factor *= _dof.get(all_species[_l], 1)
+        g_factor = 1.0 / _dof.get(all_species[target_idx], 1)
 
 
         @vegas_mod.lbatchintegrand
@@ -1100,11 +1102,18 @@ class BEST:
                 print(f"\n  Computing C[f] for {species} ({stat}):")
                 print(f"    Grid points: {n_r}")
 
+            # one state of the observed species: |M|^2 (summed over all internal
+            # states) divided by its own g, as in the Vegas path
+            g = self.species_dof.get(species, 1)
+            if callable(M_squared):
+                M_squared_species = (lambda t, M=M_squared, g=g: M(t) / g)
+            else:
+                M_squared_species = M_squared / g
             key = (species, M_squared)
             if key not in self._analytical_integrators:
                 self._analytical_integrators[key] = \
                     CollisionIntegral2to2Analytical(
-                        self.q_min, self.q_max, M_squared,
+                        self.q_min, self.q_max, M_squared_species,
                         masses=masses, n_F=n_F, grid='log')
             ci = self._analytical_integrators[key]
 

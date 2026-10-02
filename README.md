@@ -8,7 +8,7 @@ A Python framework for solving the momentum-resolved Boltzmann equation for arbi
 
 ## Overview
 
-BEST evaluates the collision integral directly in 3(*n*_total − 2) dimensions using the [Vegas](https://vegas.readthedocs.io/) adaptive Monte Carlo algorithm. It is designed for cosmological applications where the standard number-density (integrated) Boltzmann equation is insufficient and the full phase-space distribution must be tracked.
+BEST evaluates the collision integral directly in 3(*n*_total − 2) dimensions (one azimuth integrated out analytically since v1.2.6) using the [Vegas](https://vegas.readthedocs.io/) adaptive Monte Carlo algorithm. It is designed for cosmological applications where the standard number-density (integrated) Boltzmann equation is insufficient and the full phase-space distribution must be tracked.
 
 Key features:
 
@@ -145,12 +145,17 @@ mpirun -np 8 python3 examples/2to2m1.py
 `matrix_element_squared(momenta)` returns the bare |M|² of the Feynman rules,
 couplings included, one value per Vegas batch point (`momenta` has shape
 (n_particles, 3, N); see `examples/propagator.py` for momentum-dependent
-amplitudes). This is the standard convention of particle physics: |M|² is the
-squared amplitude with the couplings of the Lagrangian, and the
-symmetry factors for identical particles belong to the phase space. The solver applies that
-factor, 1/(∏ n_in,s! ∏ n_out,s!), and the leg multiplicities itself
-(`add_process(..., symmetry_factor='auto')`, the default); pass
-`symmetry_factor=1.0` if your |M|² already contains the factor.
+amplitudes). |M|² is the squared amplitude with the couplings of the
+Lagrangian; the symmetry factors for identical particles belong to the phase
+space, as usual. The solver's convention for internal states is the
+unaveraged sum over every leg, initial and final: a spin-averaged
+$\overline{|M|^2}$ of the textbooks is converted by multiplying with the
+initial-state degrees of freedom, $\sum|M|^2 = g_1 g_2\,\overline{|M|^2}$.
+The solver divides by the degrees of freedom of the observed species
+(`initialize_species(..., dof=...)`, default 2 for fermions and 1 for bosons)
+and applies the symmetry factor 1/(∏ n_in,s! ∏ n_out,s!) and the leg
+multiplicities itself (`add_process(..., symmetry_factor='auto')`, the
+default); pass `symmetry_factor=1.0` if your |M|² already contains the factor.
 
 `initialize_species` also accepts a `(q, f)` pair of arrays or a two-column
 text file (`q f`, comoving q at a₀). A species initialized at zero is seeded
@@ -245,6 +250,15 @@ warning and re-adapts. The keys of `matrix_elements_squared` are process
 names (or function names); lambdas and closures are restored by process name.
 
 ## Changelog
+
+### v1.2.9
+- Internal degrees of freedom: `matrix_element_squared` is summed over the
+  internal states of every particle, initial and final; the solver divides by
+  the observed species' dof (Vegas and analytical paths). Previously the
+  solver multiplied by the dof of the other legs, which required an |M|^2
+  averaged over all states. Species with dof = 1 are unchanged; user
+  matrix elements for fermions or other multi-state species give different
+  numbers than in v1.2.8. `initialize_species(..., dof=...)` documented.
 
 ### v1.2.8
 - Matrix elements: `matrix_element_squared(momenta)` returns the bare |M|^2 with
