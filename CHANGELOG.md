@@ -1,0 +1,117 @@
+# Changelog
+
+### v1.2.10
+- 1↔2 processes (decays and inverse decays): energy conservation is solved
+  exactly by the two-body kinematics, one log-sampled variable on the
+  closed-form kinematic window; no on-shell projection, `delta_width` unused.
+
+### v1.2.9
+- Internal degrees of freedom: `matrix_element_squared` is summed over the
+  internal states of every particle, initial and final; the solver divides by
+  the observed species' dof (Vegas and analytical paths). Previously the
+  solver multiplied by the dof of the other legs, which required an |M|^2
+  averaged over all states. Species with dof = 1 are unchanged; user
+  matrix elements for fermions or other multi-state species give different
+  numbers than in v1.2.8. `initialize_species(..., dof=...)` documented.
+- Integrand: samples with a massless leg projected to zero energy no longer
+  produce inf (the phase-space factor is evaluated on valid samples only), and
+  rate-density values below `rate_flush` = 1e-150 are set to zero so that
+  Vegas never divides by an underflowed variance. Both affected only 1→2
+  decays and massless legs at large q; other results are unchanged.
+
+### v1.2.8
+- Matrix elements: `matrix_element_squared(momenta)` returns the bare |M|^2 with
+  the couplings inside; the `coupling` argument of `add_process` is gone. The
+  symmetry factor for identical particles, 1/(prod n_in,s! prod n_out,s!), is applied by the
+  solver (`symmetry_factor='auto'`, the default; a number overrides it). This
+  is the standard convention of particle physics: |M|^2 is the squared Feynman
+  amplitude with the couplings of the Lagrangian (lam^2 for
+  L = -(lam/4!) phi^4), and the symmetry factors belong to the phase
+  space, where the solver puts them. Not compatible with earlier
+  matrix-element functions or checkpoints;
+  `load_checkpoint(..., matrix_elements_squared={process name: func})`.
+  The examples use lam = 1 (lam5 = 1); the paper's figures correspond to
+  lam = 2 and lam5 = sqrt(12) in this convention.
+- `initialize_species` accepts a tabulated spectrum, `(q, f)` arrays or a
+  two-column text file; a species initialized at zero is seeded from its
+  production spectrum at the first step (`f_seed`), so freeze-in runs start
+  from an empty species.
+- Rate quality control: a grid point is skipped only when both directions
+  vanish; an empty species in the input slot previously lost its gain.
+- Checkpoint: integrator maps restored but not yet re-wrapped were saved as
+  their `map()` method (crash on the next resume when a backward fallback
+  fired); fixed. A process that cannot be restored is an error, not a warning.
+- `n_r_parallel` must divide the number of MPI ranks (was an IndexError later).
+
+### v1.2.7
+- History records each species' mass per snapshot (time-dependent masses).
+
+### v1.2.6
+- Sampling frame aligned with the observed momentum (target on the polar
+  axis) and one azimuth integrated out by rotational symmetry: results
+  identical, one fewer integration dimension.
+- `adapt_width`: widening capped at `delta_width` = 0.05.
+
+### v1.2.5
+- Energy conservation by on-shell projection: each sample is projected onto
+  the exact E_in = E_out shell (kinetic energies rescaled by (1 ∓ λ) on the
+  initial/final side, λ = ΔE/K_tot, observed leg fixed) and f is read there;
+  the Gaussian only weights how far off-shell the sample was. Equilibrium is
+  therefore an exact fixed point (gain − loss vanishes sample by sample), and
+  the width `delta_width` × K_tot keeps tracking the shell as T drops.
+
+### v1.2.4
+- Checkpoints store vegas AdaptiveMaps instead of full Integrators;
+  fixes the MPI gather overflow at large neval.
+
+### v1.2.3
+
+- Backward (gain) rates: single joint Vegas evaluation of (FW+BW, FW, BW)
+  on common sample points; the net is the correlated difference. Deep-tail
+  gains become measurable. Supersedes the v1.2.1 reconstruction gate
+  (removed, with `bw_recon_nsigma` and the per-direction width entry).
+- BW fallback to its own adaptive map when the joint error is poor;
+  unmeasurable modes are held or zeroed (subdominant only). Counts and
+  min/max rel. error in the `verbose` step summary.
+- `exprb_seq`: stiffness ordering now uses the f-weighted bulk loss rate
+  per process (previously the per-mode maximum); mid-step interpolator
+  rebuilds use a(t), the final one a(t+dt).
+- ~~`2to2m1.py`: docstring documents the `coupling`/`matrix_element` convention
+  (symmetry factors assumed included in |M|²).~~ *(superseded in v1.2.8: the
+  solver applies the symmetry factor itself)*
+
+### v1.2.2
+
+- Tail extrapolation fits in the comoving energy (scale factor passed to the
+  interpolator); removes a slope bias growing with expansion.
+- High-side extrapolation slope: Theil–Sen fit, robust against disturbed
+  boundary modes; separate `n_high` window.
+- Vegas sampling domain extended past the grid top (`domain_extension`,
+  default 1.5×); restores the down-scattering resupply of the top modes,
+  which was truncated at `q_max` and bent the boundary band after freeze-out.
+- `2to2m1.py`: accuracy defaults tightened (neval 10⁵ → 10⁶, fixed narrow
+  energy-conservation width).
+
+### v1.2.1
+
+- New `exprb_seq` time integrator: sequential (Gauss–Seidel) exponential
+  splitting over processes.
+- ~~Near-equilibrium backward rates: direct net-rate integrator with a
+  significance-gated reconstruction (BW = FW + net), removing the
+  near-cancellation noise of subtracting two gross rates.~~
+  *(superseded in v1.2.3)*
+- Interior interpolation of log(1/f + η) switched to a monotone (PCHIP)
+  cubic — no spline ringing across populated/empty boundaries.
+- Representation floors extended and made consistent (f resolved down to
+  1e-300 through the interpolator and the rate assembly).
+- Checkpoint resume now restores each MPI group's adaptive integration
+  widths correctly (previously they reverted to stale values on the next
+  save after a resume).
+- `evolve_step` rejects unknown `method` strings instead of silently
+  skipping the update; overflow guard in the adaptive-dt controller for
+  strongly driven Bose-enhanced modes.
+- `solver.verbose = True` exposes estimator internals (BW estimator
+  selection counts, rel_err statistics).
+- Sub-threshold freeze-out example rewritten as the constant-dof protocol
+  run (`ann` + elastic, `exprb_seq`), with matching spectra and yield plot
+  scripts.

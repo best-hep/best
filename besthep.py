@@ -422,6 +422,9 @@ class BEST:
         (px, py, pz) of the particles in the order input + output, for a batch
         of Vegas points; return one value per batch point (energies are on
         shell, E = sqrt(p^2 + m^2)).
+        For processes with three legs (1 <-> 2) the energy delta function is
+        solved exactly (two-body kinematics, one integration variable);
+        delta_width and adapt_width are not used there.
         symmetry_factor: symmetry factor for identical particles multiplying |M|^2. 'auto'
         (default) is 1/(prod_s n_in,s! * prod_s n_out,s!) from the species lists;
         a number overrides it (1.0 if the function already contains the factor).
@@ -541,13 +544,19 @@ class BEST:
             # Rotational symmetry about the target axis: the azimuth of the
             # first integrated leg is fixed at 0 (its 2*pi is folded into the
             # Jacobian), so the domain has 3*n_integrate - 1 dimensions.
+            # Three legs in total (decays, inverse decays): energy conservation
+            # fixes the angle of the single sampled leg, leaving one dimension,
+            # the log of its energy (see collision_integrand_batch).
             domain = []
-            for k_leg in range(n_integrate):
-                domain.extend([
-                    [self.q_min, self.q_max * self.domain_extension], [0, np.pi]
-                ])
-                if k_leg > 0:
-                    domain.append([0, 2 * np.pi])
+            if n_integrate == 1:
+                domain = [[0.0, 1.0]]
+            else:
+                for k_leg in range(n_integrate):
+                    domain.extend([
+                        [self.q_min, self.q_max * self.domain_extension], [0, np.pi]
+                    ])
+                    if k_leg > 0:
+                        domain.append([0, 2 * np.pi])
             if self.sub_rank == 0 and self.world_rank == 0:
                 print(f"  Creating Vegas integrator for {proc_key} ({mode}) "
                       f"[group {self.color}]: {len(domain)} dimensions",
@@ -559,6 +568,43 @@ class BEST:
             # restored from checkpoint as AdaptiveMap: rebuild the Integrator on it
             self.vegas_integrators[proc_key][key] = self._vegas.Integrator(entry, mpi=True)
         return self.vegas_integrators[proc_key][key]
+
+    @staticmethod
+    def _two_body_window(E_t, p_t, m_t, m_s, m_c, target_alone, p_max):
+        """Momentum window [p_lo, p_hi] of the sampled leg s in a three-leg
+        process with the target t fixed, from the two-body kinematics.
+        target_alone: t is alone on its side (parent) -- then s and c are its
+        decay products and E_s = gamma (E* -/+ beta p*) in the lab;
+        otherwise t and s share a side and c is the parent: the window follows
+        from the invariant mass of the pair (t, s) reaching m_c at some angle.
+        p_max bounds an open window from above."""
+        from scipy.optimize import brentq
+        if target_alone:
+            E_star = (m_t**2 + m_s**2 - m_c**2) / (2.0 * m_t)
+            p_star_sq = E_star**2 - m_s**2
+            if p_star_sq <= 0.0:
+                return None
+            p_star = np.sqrt(p_star_sq)
+            gamma, beta = E_t / m_t, p_t / E_t
+            E_lo, E_hi = gamma * (E_star - beta * p_star), gamma * (E_star + beta * p_star)
+        else:
+            B = 0.5 * (m_c**2 - m_t**2 - m_s**2)
+            p_of = lambda E: np.sqrt(max(E**2 - m_s**2, 0.0))
+            f_lo = lambda E: E_t * E + p_t * p_of(E) - B   # antiparallel pair reaches m_c (increasing in E)
+            f_hi = lambda E: E_t * E - p_t * p_of(E) - B   # parallel pair below m_c; minimum where s moves with t's velocity
+            E_max = np.sqrt(p_max**2 + m_s**2)
+            if f_lo(E_max) < 0.0:
+                return None
+            E_lo = m_s if f_lo(m_s) >= 0.0 else brentq(f_lo, m_s, E_max)
+            E_v = min(m_s * E_t / m_t, E_max) if m_t > 0.0 else E_max   # massless target: f_hi decreasing
+            if f_hi(E_v) > 0.0:
+                return None
+            E_a = m_s if f_hi(m_s) <= 0.0 else brentq(f_hi, m_s, E_v)
+            E_b = E_max if f_hi(E_max) <= 0.0 else brentq(f_hi, E_v, E_max)
+            E_lo, E_hi = max(E_lo, E_a), E_b
+        p_lo = np.sqrt(max(E_lo**2 - m_s**2, 0.0))
+        p_hi = min(np.sqrt(max(E_hi**2 - m_s**2, 0.0)), p_max)
+        return (p_lo, p_hi) if p_hi > p_lo else None
 
     # ------------------------------------------------------------------
     # Batch collision integrand (core)
@@ -628,6 +674,98 @@ class BEST:
         _dof = getattr(self, 'species_dof', {})
         g_factor = 1.0 / _dof.get(all_species[target_idx], 1)
 
+        def _flush(y):
+            # values below rate_flush are exact zeros (see the class attribute)
+            y[np.abs(y) < rate_flush] = 0.0
+            return y
+
+        def _pack(FW, BW, common):
+            if mode == 'joint':
+                # same samples for FW and BW; vegas adapts to column 0 = FW + BW,
+                # columns 1, 2 are the estimates actually used
+                out = np.empty((FW.size, 3))
+                out[:, 0] = _flush((FW + BW) * common)
+                out[:, 1] = _flush(FW * common)
+                out[:, 2] = _flush(BW * common)
+                return out
+            if mode == 'forward':
+                return _flush(FW * common)
+            if mode == 'backward':
+                return _flush(BW * common)
+            return _flush((BW - FW) * common)
+
+        eta = np.array([1.0 if st == 'boson' else (-1.0 if st == 'fermion' else 0.0) for st in stats])
+
+        def _statistics(f_arr):
+            # FW: product of the initial-state f times the final-state (1 + eta f);
+            # BW: the reverse. eta = +1 boson, -1 fermion, 0 Maxwell-Boltzmann.
+            FW = np.ones_like(f_arr[0]); BW = np.ones_like(f_arr[0])
+            for k in range(n_total):
+                block = 1.0 + eta[k] * f_arr[k]
+                if k < n_in:
+                    FW *= f_arr[k]; BW *= block
+                else:
+                    BW *= f_arr[k]; FW *= block
+            return FW, BW
+
+        if n_total == 3:
+            # Two-body kinematics (1 <-> 2). With the target fixed and the conserved
+            # leg c from momentum conservation, energy conservation fixes the angle of
+            # the one sampled leg s, so no on-shell projection is needed:
+            #   d^3p_s/((2pi)^3 2E_s) d^3p_c/((2pi)^3 2E_c) (2pi)^4 delta^4 = dE_s/(8 pi p_t),
+            #   C = sym |M|^2 / (16 pi g_t E_t p_t) * int dE_s [BW - FW].
+            # E_s is sampled log-uniformly on its kinematic window (closed form); the
+            # log map flattens the soft region where Bose factors grow as 1/E_s.
+            # delta_width and adapt_width are not used on this path.
+            s_idx, c_idx = integrate_indices[0], conserved_idx
+            sgn = np.array([1.0] * n_in + [-1.0] * n_out)       # +1 input side, -1 output side
+            m_t, m_s, m_c = masses[target_idx], masses[s_idx], masses[c_idx]
+            p_t = q1_mag / a
+            E_t = np.sqrt(p_t**2 + m_t**2)
+            window = self._two_body_window(
+                E_t, p_t, m_t, m_s, m_c,
+                target_alone=(sgn[target_idx] != sgn[s_idx] and sgn[target_idx] != sgn[c_idx]),
+                p_max=self.q_max * self.domain_extension / a)
+            if window is None:                                   # kinematically closed: the rate is zero
+                E_lo, log_range, p_fill = m_s, 0.0, self.q_min / a
+            else:
+                E_lo, E_hi = (np.sqrt(window[0]**2 + m_s**2), np.sqrt(window[1]**2 + m_s**2))
+                log_range, p_fill = np.log(E_hi / E_lo), window[1]
+            angle_sign = sgn[target_idx] * sgn[s_idx]
+
+            @vegas_mod.lbatchintegrand
+            def integrand_two_body(x):
+                N = x.shape[0]
+                E_s = E_lo * np.exp(x[:, 0] * log_range)
+                p_s = np.sqrt(np.maximum(E_s**2 - m_s**2, 0.0))
+                E_c = -(sgn[target_idx] * E_t + sgn[s_idx] * E_s) / sgn[c_idx]
+                valid = (E_c > m_c) & (p_s > 0.0)
+                p_c = np.sqrt(np.where(valid, E_c**2 - m_c**2, 0.0))
+                cos_th = np.where(valid, (p_c**2 - p_t**2 - p_s**2)
+                                  / (2.0 * angle_sign * p_t * np.where(valid, p_s, 1.0)), 0.0)
+                valid &= np.abs(cos_th) <= 1.0
+                sin_th = np.sqrt(1.0 - np.clip(cos_th, -1.0, 1.0)**2)
+
+                mom_x = np.zeros((n_total, N)); mom_y = np.zeros((n_total, N)); mom_z = np.zeros((n_total, N))
+                mom_z[target_idx] = p_t
+                mom_x[s_idx], mom_z[s_idx] = p_s * sin_th, p_s * cos_th
+                for comp in (mom_x, mom_y, mom_z):
+                    comp[c_idx] = -(sgn[target_idx] * comp[target_idx] + sgn[s_idx] * comp[s_idx]) / sgn[c_idx]
+
+                # occupations at the exact momenta (comoving q = a p); invalid samples
+                # are evaluated at a harmless point and get zero weight
+                f_arr = [None] * n_total
+                f_arr[target_idx] = np.clip(interps[all_species[target_idx]](np.full(N, q1_mag)), 0, None)
+                f_arr[s_idx] = np.clip(interps[all_species[s_idx]](np.where(valid, p_s, p_fill) * a), 0, None)
+                f_arr[c_idx] = np.clip(interps[all_species[c_idx]](np.where(valid, p_c, p_fill) * a), 0, None)
+                FW, BW = _statistics(f_arr)
+
+                M_sq = matrix_element_squared(np.stack([mom_x, mom_y, mom_z], axis=1)) * symmetry_factor
+                measure = np.where(valid, E_s * log_range / (8.0 * np.pi * p_t), 0.0)   # dE_s/(8 pi p_t)
+                common = sign * g_factor * M_sq * measure / (2.0 * E_t)
+                return _pack(FW, BW, common)
+
+            return integrand_two_body
 
         @vegas_mod.lbatchintegrand
         def integrand(x):
@@ -735,25 +873,7 @@ class BEST:
                 f_arr.append(np.clip(interps[sp](r_k), 0, None))
 
             # Statistical factors
-            if mode in ('backward', 'net', 'joint'):
-                BW = np.ones(N)
-                for k in range(n_in, n_total):
-                    BW *= f_arr[k]
-                for k in range(n_in):
-                    if stats[k] == 'boson':
-                        BW *= (1 + f_arr[k])
-                    elif stats[k] == 'fermion':
-                        BW *= (1 - f_arr[k])
-
-            if mode in ('forward', 'net', 'joint'):
-                FW = np.ones(N)
-                for k in range(n_in):
-                    FW *= f_arr[k]
-                for k in range(n_in, n_total):
-                    if stats[k] == 'boson':
-                        FW *= (1 + f_arr[k])
-                    elif stats[k] == 'fermion':
-                        FW *= (1 - f_arr[k])
+            FW, BW = _statistics(f_arr)
 
             momenta_batch = np.stack([mom_x, mom_y, mom_z], axis=1)
             M_sq = matrix_element_squared(momenta_batch) * symmetry_factor
@@ -763,29 +883,7 @@ class BEST:
             for k in range(n_total):
                 bad |= (energies[k] < cutoff_e)
             common[bad] = 0.0
-
-            # An empty species (f = f_floor) alone in an input slot leaves FW at
-            # ~1e-304 instead of underflowing to 0 as a product of two floors
-            # does; such columns break vegas (see rate_flush). Flush them to an
-            # exact zero, which the quality control already handles.
-            def _flush(x):
-                x[np.abs(x) < rate_flush] = 0.0
-                return x
-
-            if mode == 'joint':
-                # Same sample for FW and BW (lbatch: batch index first).
-                # vegas adapts to column 0 = FW+BW, which covers both peaks;
-                # columns 1, 2 are the estimates actually used.
-                out = np.empty((N, 3))
-                out[:, 0] = _flush((FW + BW) * common)
-                out[:, 1] = _flush(FW * common)
-                out[:, 2] = _flush(BW * common)
-                return out
-            if mode == 'forward':
-                return _flush(FW * common)
-            if mode == 'backward':
-                return _flush(BW * common)
-            return _flush((BW - FW) * common)
+            return _pack(FW, BW, common)
 
         return integrand
 
@@ -1186,6 +1284,9 @@ class BEST:
         which evolve_step broadcasts."""
         procs = [p for p, c in self.process_configs.items()
                  if species in c['input'] + c['output']]
+        if self.world_rank == 0:
+            print(f"\nSeeding {species} (initialized empty) from its production spectrum: "
+                  f"rate pass via {', '.join(procs)} at t = {self.current_time:.3e}", flush=True)
         rates, _, _ = self._compute_rates_vegas(procs, t=self.current_time)
         if self.world_rank == 0:
             G = np.clip(np.asarray(rates[species], float), 0.0, None)
