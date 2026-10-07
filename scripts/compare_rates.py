@@ -53,7 +53,6 @@ n_grid = 200
 coupling = 1.0
 mass = 1.0
 neval = int(1e6)
-delta_width = 0.01
 
 # ======================================================================
 # Setup
@@ -71,8 +70,7 @@ solver.initialize_species(
 solver.add_process(
     'phi_2to2', ['phi', 'phi'], ['phi', 'phi'],
     matrix_element_constant,
-    neval=neval, nitn=2,
-    delta_width=delta_width)
+    neval=neval, nitn=2)
 
 # ======================================================================
 # Compute rates: Vegas

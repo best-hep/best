@@ -39,17 +39,17 @@ def init_f(r, r0=3.0, width=2.0):
 # ======================================================================
 q_min    = 0.1
 q_max    = 50.0
-n_grid   = 68*2
+n_grid   = 80
 mass     = 1.0
-neval    = int(1e7)
+neval    = int(1e5)
 dt       = 1e5
-n_steps  = 3000
+n_steps  = 300
 checkpoint_file = "checkpoint.pkl"
 
 # ======================================================================
 # Setup
 # ======================================================================
-solver = BEST(q_min=q_min, q_max=q_max, n_grid=n_grid, n_r_parallel=n_grid)
+solver = BEST(q_min=q_min, q_max=q_max, n_grid=n_grid)
 
 resume = os.path.exists(checkpoint_file) and solver.world_rank == 0
 resume = solver.world_comm.bcast(resume, root=0)

@@ -1,6 +1,5 @@
 """
 BEST-hep example: thermalization via 2<->2 elastic scattering (massive).
-
 Run: mpirun -np 8 python examples/2to2m1.py
 
 Matrix-element convention
@@ -43,9 +42,9 @@ q_min    = 0.1      # momentum grid lower bound
 q_max    = 50.0     # momentum grid upper bound
 n_grid   = 40       # number of momentum grid points
 mass     = 1.0      # phi mass
-neval    = int(1e6) # Vegas evaluations
+neval    = int(1e4) # Vegas evaluations
 dt       = 1e2      # base time step
-n_steps  = 20       # number of evolution steps
+n_steps  = 100      # number of evolution steps
 
 checkpoint_file = "checkpoint.pkl"  # saved state (delete to start fresh)
 

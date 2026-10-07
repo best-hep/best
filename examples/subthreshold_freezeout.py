@@ -49,9 +49,7 @@ def T_of_a(a):
 
 # --------------------------- numerics --------------------------------------
 q_min, q_max, n_grid = 0.1, 4, 40
-neval, dt_frac, n_steps = int(1e6), 0.01, 500
-delta_width, adapt_width = 0.001, False
-max_rel_err, min_rel_err, max_rel_change = 0.01, 0.001, 0.3
+neval, dt_frac, n_steps = int(1e5), 0.01, 500
 checkpoint_file = "checkpoint.pkl"
 
 # --------------------------- physics ---------------------------------------
@@ -82,9 +80,7 @@ def init_phi1(q): return be_on_grid(q, m1, T0_bath, a0)
 def init_phi2(q): return be_on_grid(q, m2, T0_bath, a0)
 
 # --------------------------- setup -----------------------------------------
-solver = BEST(q_min=q_min, q_max=q_max, n_grid=n_grid,
-              max_rel_change=max_rel_change, adapt_width=adapt_width,
-              max_rel_err=max_rel_err, min_rel_err=min_rel_err)
+solver = BEST(q_min=q_min, q_max=q_max, n_grid=n_grid)
 solver.verbose = False
 solver.scale_factor = scale_factor
 phi2_bath = PhiTwoBath(m2)
@@ -108,10 +104,10 @@ else:
     solver.initialize_species('phi2', init_phi2, stat='boson', mass=m2)
     solver.add_process('el', ['phi1', 'phi2'], ['phi1', 'phi2'],
                        matrix_element_el,
-                       neval=neval, delta_width=delta_width, nitn=2)
+                       neval=neval, nitn=2)
     solver.add_process('ann', ['phi1', 'phi1'], ['phi2', 'phi2'],
                        matrix_element_ann,
-                       neval=neval, delta_width=delta_width, nitn=2)
+                       neval=neval, nitn=2)
     solver.current_time = t0
     history = solver.init_history()
 

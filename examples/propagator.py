@@ -1,7 +1,5 @@
 """
-BEST-hep example: momentum-dependent matrix elements.
-
-Run: mpirun -np 8 python propagator.py
+BESThep example: momentum-dependent matrix elements.
 
 This example shows how to write a |M|^2 that depends on the particle
 momenta, using s-channel and t-channel Breit-Wigner propagators as
@@ -43,6 +41,8 @@ Only 3-momenta are provided; the energy is reconstructed on-shell as
 E_i = sqrt(|p_i|^2 + m_i^2) using the known particle mass. The return
 value must be an array of length N (the squared amplitude at each
 sample point).
+
+Run: mpirun -np 4 python propagator.py
 """
 import sys
 import os
@@ -121,7 +121,7 @@ solver.initialize_species('phi', init_f, stat='boson', mass=M_PHI)
 solver.add_process('scatter',
                    ['phi', 'phi'], ['phi', 'phi'],
                    matrix_element_squared,
-                   neval=int(1e5))
+                   neval=int(1e4))
 
 history = solver.init_history()
 
