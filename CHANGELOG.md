@@ -1,5 +1,84 @@
 # Changelog
 
+### v1.3.1
+- CP violation: the reverse direction of a process no longer has to carry the
+  forward |M|^2. `add_process(..., mesq_backward=func)` gives
+  the reverse |M|^2 directly (a process whose reverse is its own CP conjugate, or
+  a subtracted remainder); `add_process(..., cp_conjugate='name')` links a process
+  to its CP conjugate: the two are integrated on the same Vegas samples slot by
+  slot, so that the difference of a particle's and its antiparticle's
+  distributions is free of the noise they share, and without a reverse |M|^2 of
+  their own each one's reverse is the other's forward |M|^2 (CPT). The backward
+  fallback and the quality control of a grid point treat a pair as a whole, its
+  iterations are combined with one weight per iteration (as for every process,
+  see Fixed below), and in `exprb_seq` a pair is one substep.
+  `initialize_species(..., antiparticle=)` declares antiparticles (a
+  self-conjugate species names itself); the solver
+  checks a pair slot by slot (mass, statistics, dof, grid, identical particles,
+  declared antiparticles, same neval/nitn/alpha, species initialized before, a
+  reverse |M|^2 for both members or neither), not the physics (CPT consistency,
+  unitarity and the real-intermediate-state subtraction are the user's; see the
+  README). Jacobian, ledgers and checkpoints work as for any process
+  (`matrix_elements_squared={'name': (func, func_backward)}`; a checkpoint
+  restores what was there and refuses a reverse |M|^2 for a process saved without
+  one). `scripts/check_conjugate.py`.
+- Custom collision terms: `add_custom_term(name, func, jacobian=None)` with
+  `func(solver) -> {species: (gain, loss)}` on the grid. They take part in every
+  rate pass, in the exponential steppers, in the seeding of empty species and
+  in the per-process gain/loss ledgers like a process; checkpoints store them by
+  function name (`load_checkpoint(..., custom_terms=...)`).
+- `solver.step_hook(solver)` is called at the start of every step (medium
+  quantities such as thermal or Debye masses computed once per step; mass
+  functions and matrix elements may read the solver).
+- `solver.compute_rates()` runs a rate pass without stepping (rates and the
+  per-process gain/loss ledgers at the current state).
+- New method `exprb2` (two-stage exponential Rosenbrock, ETD2RK; `exprb2_update`):
+  the `exprb` predictor, a second rate pass at the predicted state and a φ₂
+  correction. Second order; a stiff species follows its moving equilibrium with
+  the physical lag 1/Γ, where `exprb` lags by one step, so quantities sourced by
+  that departure (a CP asymmetry in strong wash-out) no longer need dt ≪ 1/Γ.
+- `examples/Mdecay_cp.py`: the CP asymmetry of N ↔ Φ l as a result of the run,
+  with the decay and its CP conjugate as a pair (each with its forward |M|^2 as
+  the reverse one), l and lbar as species, the plasma coupling of the leptons as
+  a custom term with its Jacobian and `exprb_full`, next to the integrated
+  reference D1 of Hahn-Woernle, Plümacher & Wong 2009 (README, CP violation);
+  `scripts/plot_cp.py` plots its output. `scripts/check_asymmetry.py`:
+  the same asymmetry from the linear asymmetry equation (HPW's formulation) with
+  the momentum-resolved N, leptons in kinetic equilibrium, `exprb2`, against an
+  exact solution of the mode equations. `scripts/check_custom_term.py`: the
+  decay written as one-dimensional kernels against the Vegas process (rates,
+  Jacobian, evolution, seeding, checkpoint).
+- Fixed: a second `BEST` instance in one MPI program took the communicator the
+  first one had repointed `MPI.COMM_WORLD` at for Vegas as its world, so under
+  `mpirun` every rank ran it alone (and printed); the world communicator is now
+  taken once at import. Single-instance scripts are unchanged.
+- Fixed: the rates of every process are taken from Vegas' per-iteration
+  estimates combined with one weight per iteration (the inverse variance of the
+  sum column), the combination the CP pairs use. Vegas' own weighted average of
+  the joint columns [FW+BW, FW, BW] inverts a singular covariance through an SVD
+  cut, which moved the loss and the gain off their common-sample estimate: in
+  the Mdecay runs this was the drift of the conserved numbers and of the
+  comoving energy and the step-to-step noise of the soft occupations. Elastic
+  conservation is now at the quadrature level of the grid. Unpaired processes
+  no longer reproduce 1.3.0 bit for bit, and the quality-control counts can
+  differ from 1.3.0, since the σ they act on is now that of the scalar
+  combination.
+- Fixed: `load_checkpoint` left a species that the resuming script had
+  initialized empty marked for seeding, so the first step after the restore
+  overwrote its restored distribution with the seed spectrum; a restored
+  species is now seeded only if it is still at the floor. `step_hook` is now
+  called before the seeding of empty species, so the seed sees the medium of
+  the step. An antiparticle declaration that contradicts an earlier one is
+  refused before anything is recorded. A custom term's entry for a species
+  outside `species_list` is skipped, as a process's is.
+- `BEST.J_SIG` (default 1.0): in `exprb_full` an entry of the Monte Carlo
+  Jacobian is used only if |J| ≥ J_SIG·σ, σ from the sum of squares of its
+  sample contributions (the rate quality-control rule applied to J); the
+  verbose line of the step reports the counts zeroed/kept. Unresolved entries
+  of a row whose true value is ~0 (tail nodes) otherwise pair with the large
+  exact couplings into that node and give the matrix exponential spurious
+  eigenvalues, which blew up the self-consistent-bath runs. 0 disables.
+
 ### v1.3.0
 - Exact kinematics for every process: the last two free legs are generated by
   two-body kinematics in the rest frame of their total four-momentum and
@@ -17,7 +96,8 @@
 - A note is printed when a massless species is initialized (its rates grow as
   1/E in the infrared; a thermal mass m ∝ 1/a caps the stiffness).
 - The initialization log prints the number density n with the normalization of
-  `compute_moments` (g/(2π²)); it used to print 4π∫f q² dq.
+  `compute_moments` (g/(2π²)); it used to print 4π∫f q² dq. Species named
+  `times` or `a` are refused (keys of the history dict).
 
 ### v1.2.10
 - 1↔2 processes (decays and inverse decays): energy conservation is solved

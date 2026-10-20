@@ -17,6 +17,19 @@ Usage:
     # inside; the symmetry factor for identical particles is applied automatically.
     solver.evolve_step(dt=1.0, method='exprb')   # exponential Rosenbrock-Euler
 
+    solver.add_custom_term('split', func)         # func(solver) -> {species: (gain, loss)} on the grid
+    solver.step_hook = medium                     # medium(solver): called once at the start of each step
+
+    # CP violation: the reverse direction output -> input has the forward |M|^2
+    # (T invariance) unless its |M|^2 is given or the process has a CP conjugate
+    solver.initialize_species('lbar', f_th, stat='fermion', antiparticle='l')   # declared both ways; N: antiparticle='N'
+    solver.add_process('decA', ['N'], ['Phi', 'l'], M2_A)
+    solver.add_process('decB', ['N'], ['Phibar', 'lbar'], M2_B, cp_conjugate='decA')
+        # linked pair: integrated on the same Vegas samples slot by slot; each one's
+        # reverse |M|^2 is the other's forward one (CPT) unless given
+    solver.add_process('dl2', ['Phi', 'l'], ['Phibar', 'lbar'], M2, mesq_backward=M2_rev)
+        # the reverse |M|^2 given (a process whose reverse is its own CP conjugate)
+
 Time-stepping methods (evolve_step, method=...):
     'euler' : explicit log-space Euler.
     'heun'  : explicit 2-stage predictor-corrector (2 Vegas passes/step).
@@ -28,6 +41,14 @@ Time-stepping methods (evolve_step, method=...):
               Schweitzer (2009), SIAM J. Numer. Anal. 47(1) 786-803; Hochbruck
               & Ostermann (2010), Acta Numerica 19, 209-286, eq. (2.47). W-type
               (inexact Jacobian): Hairer & Wanner II, IV.7.
+    'exprb2'  : two-stage exponential Rosenbrock (ETD2RK): the exprb predictor,
+              a second rate pass at the predicted state, phi2 correction.
+              Second order (2 Vegas passes/step). A stiff species follows its
+              moving equilibrium with the physical lag 1/Gamma, where 'exprb'
+              lags by one step; use it when that departure matters (the source
+              of a CP asymmetry, chemistry in strong wash-out). Not positive by
+              construction: negative occupations are set to the floor and
+              reported. Ref: Cox & Matthews (2002), J. Comput. Phys. 176, 430.
     'exprb_seq' : sequential (Gauss-Seidel) exponential splitting over
               processes: each advances the full dt with its own diagonal
               exprb substep, stiffest first; later processes' rates are
@@ -36,8 +57,8 @@ Time-stepping methods (evolve_step, method=...):
               with slow number-changing chemistry: summed 'exprb' phi1-damps
               the slow net by the stiff Gamma (chemistry suppressed ~
               Gamma_stiff*dt); the sequential form does not. Identical to
-              'exprb' for one process. First-order splitting; use
-              adapt_dt=False in stiff regimes.
+              'exprb' for one process; a CP-conjugate pair is one substep.
+              First-order splitting; use adapt_dt=False in stiff regimes.
     'exprb_full' : exponential Rosenbrock-Euler with the full Jacobian of the
               collision operator over all species and processes, accumulated
               on the Vegas samples. No splitting, no diagonal approximation:
@@ -48,12 +69,14 @@ Time-stepping methods (evolve_step, method=...):
 """
 import numpy as np
 from mpi4py import MPI
+_MPI_WORLD = MPI.COMM_WORLD      # taken before any BEST() repoints MPI.COMM_WORLD at its Vegas group
 from scipy.integrate import quad
 from scipy.interpolate import PchipInterpolator
 import time
 import os
 import pickle
 import warnings
+
 
 # ======================================================================
 # Interpolation with power-law / exponential extrapolation
@@ -207,6 +230,34 @@ def exprb_update(f, A, Gamma, dt):
     return f * np.exp(z) + A * dt * phi1
 
 
+def exprb2_update(f, A1, Gamma1, A2, Gamma2, dt):
+    """Two-stage exponential Rosenbrock step (ETD2RK) for one species: the
+    exprb_update predictor with (A1, Gamma1) of the initial state, corrected with
+    (A2, Gamma2) measured at the predicted state,
+
+        f_pred = f*exp(-Gamma1*dt) + A1*dt*phi1(-Gamma1*dt)
+        f_new  = f_pred + [(A2 - A1) - (Gamma2 - Gamma1)*f_pred]*dt*phi2(-Gamma1*dt),
+
+    phi2(z) = (phi1(z) - 1)/z. Second order in the variation of the coefficients
+    over the step (exact for A linear in time and Gamma constant). In the stiff
+    limit Gamma*dt >> 1 it returns the quasi-static state A/Gamma - (A/Gamma)'/Gamma
+    of the moving equilibrium, where exprb_update returns A/Gamma one step late;
+    the departure from equilibrium of a stiff species, which is what drives e.g.
+    the source of a CP asymmetry, is therefore resolved without dt << 1/Gamma.
+    The correction has either sign, so f_new is not positive by construction.
+    Ref: Cox & Matthews (2002), J. Comput. Phys. 176, 430 (ETD2RK)."""
+    f = np.asarray(f, float); dt = float(dt)
+    A1 = np.asarray(A1, float); Gamma1 = np.asarray(Gamma1, float)
+    A2 = np.asarray(A2, float); Gamma2 = np.asarray(Gamma2, float)
+    z = -Gamma1 * dt
+    small = np.abs(z) < 1e-4
+    zz = np.where(small, 1.0, z)
+    phi1 = np.where(small, 1.0 + z * (0.5 + z * (1.0 / 6.0 + z / 24.0)), np.expm1(zz) / zz)
+    phi2 = np.where(small, 0.5 + z * (1.0 / 6.0 + z * (1.0 / 24.0 + z / 120.0)), (phi1 - 1.0) / zz)
+    f_pred = f * np.exp(z) + A1 * dt * phi1
+    return f_pred + ((A2 - A1) - (Gamma2 - Gamma1) * f_pred) * dt * phi2
+
+
 def assemble_A_Gamma(f, gain, loss, stat):
     """Per-mode (A, Gamma) for exprb_update from the OBSERVED-mode gain and loss.
 
@@ -276,6 +327,13 @@ class BEST:
                             # and the weighted average of the joint columns divides by it
     verbose = False         # dev/debug output
     bw_fallback_rel_err = 0.3
+    J_SIG = 1.0             # exprb_full: an entry of the Monte Carlo Jacobian is used only if
+                            # |J_ij| >= J_SIG * sigma_ij (sigma from the sum of squares of the
+                            # sample contributions, accumulated with the row). Same rule as the
+                            # rate quality control (rel_err > 1 -> dropped). Unresolved entries
+                            # of a row whose true value is ~0 (tail nodes) would otherwise pair
+                            # with the large exact couplings INTO that node and give the matrix
+                            # exponential spurious eigenvalues +-sqrt(big * noise). 0 disables.
     def __init__(self, q_min, q_max, n_grid=500, n_r_parallel=None, max_rel_change=0.3):
         """Initialize the Boltzmann solver.
 
@@ -306,7 +364,7 @@ class BEST:
         """
 
         # ---- MPI setup ----
-        self.world_comm = MPI.COMM_WORLD
+        self.world_comm = _MPI_WORLD     # not MPI.COMM_WORLD: an earlier instance has repointed that at its group
         self.world_rank = self.world_comm.Get_rank()
         self.world_size = self.world_comm.Get_size()
 
@@ -326,7 +384,8 @@ class BEST:
         self.sub_rank = self.sub_comm.Get_rank()
         self.sub_size = self.sub_comm.Get_size()
 
-        # Patch MPI.COMM_WORLD so vegas uses sub_comm
+        # Patch MPI.COMM_WORLD so vegas uses sub_comm (Vegas reads it at call
+        # time; the most recently created instance's grouping is the one in force)
         import mpi4py.MPI
         mpi4py.MPI.COMM_WORLD = self.sub_comm
         import vegas
@@ -336,6 +395,7 @@ class BEST:
         self.species_config = {}   # {name: 'boson'/'fermion'}
         self.species_mass = {}     # {name: mass} (0.0 = massless)
         self.species_mass_func = {}  # {name: func(t) -> mass}
+        self.species_antiparticle = {}  # {name: antiparticle name}, both ways; a self-conjugate species names itself
         self.q_min = q_min
         self.q_max = q_max
         self.n_grid = n_grid
@@ -347,6 +407,9 @@ class BEST:
         self.domain_extension = 1.5      # sampled-momentum domain / grid top
 
         self.process_configs = {}
+        self.custom_terms = {}           # {name: (func, jacobian)}, see add_custom_term
+        self.step_hook = lambda solver: None   # called at the start of every step
+        self.jacobian = None             # exprb_full: the Jacobian of its last step's initial state (rows: species' nodes, columns: all species' nodes in species_list order)
         self._empty_species = set()      # species initialized at the floor: seeded at the first step
         self.vegas_integrators = {}
         self._integrator_suffix = ''
@@ -392,7 +455,8 @@ class BEST:
     # Process registration
     # ------------------------------------------------------------------
     def add_process(self, name, input_species, output_species, matrix_element_squared,
-                    neval=100000, nitn=2, alpha=0.5, symmetry_factor='auto'):
+                    neval=100000, nitn=2, alpha=0.5, symmetry_factor='auto',
+                    mesq_backward=None, cp_conjugate=None):
         """Register a process.
 
         matrix_element_squared(momenta): the bare |M|^2 with the couplings inside,
@@ -409,6 +473,35 @@ class BEST:
         symmetry_factor: symmetry factor for identical particles multiplying |M|^2. 'auto'
         (default) is 1/(prod_s n_in,s! * prod_s n_out,s!) from the species lists;
         a number overrides it (1.0 if the function already contains the factor).
+
+        The reverse direction output -> input is integrated on the same samples with
+        mesq_backward(momenta) = |M(output -> input)|^2 (mesq: matrix element squared)
+        at the same momenta if given; else, when the process has a CP conjugate, with the forward
+        |M|^2 of the conjugate (CPT: |M(f -> i)|^2 = |M(ibar -> fbar)|^2); else with
+        matrix_element_squared itself (T invariance). A process whose reverse
+        direction is its own CP conjugate (Phi l -> Phibar lbar) has no partner to
+        take it from, so its reverse |M|^2 is either given or assumed T invariant.
+        For a reaction that is its own reverse (l Phi -> l Phi) |M(output -> input)|^2
+        is the forward function with the input and output blocks of momenta
+        exchanged; the reaction is integrated from one slot whichever way its
+        reverse is set.
+        cp_conjugate='name' links the process to its CP conjugate, registered
+        before: the two are integrated together on the same Vegas samples, slot by
+        slot, so that the difference of the distributions of a particle and its
+        antiparticle is free of the noise they share. The two processes must have
+        the same legs slot by slot (slot k of one holds the antiparticle of slot k of
+        the other: species of the same mass, statistics, dof and grid, identical
+        particles in the same slots, initialized before, and the antiparticles
+        declared with initialize_species(..., antiparticle=...) where they are), the
+        same neval, nitn and alpha, and a reverse |M|^2 for both members or for
+        neither; the two species of a slot must keep the same mass (checked at every
+        rate pass). The adaptation of the common integrator and the quality control
+        of a grid point act on the CP-even sum of the pair, and the iterations are
+        combined with one weight per iteration (the inverse variance of that sum),
+        so two processes whose sum vanishes (a subtracted remainder) are registered
+        unpaired. A paired
+        process that is active without its partner is still integrated with the
+        partner's columns; only the booking of the partner is suppressed.
         """
         from math import factorial
         if symmetry_factor == 'auto':
@@ -416,10 +509,12 @@ class BEST:
             for s in set(input_species) | set(output_species):
                 symmetry_factor /= (factorial(input_species.count(s))
                                     * factorial(output_species.count(s)))
-        self.process_configs[name] = {
+        config = {
             'input': input_species,
             'output': output_species,
             'matrix_element_squared': matrix_element_squared,
+            'mesq_backward': mesq_backward,
+            'cp_conjugate': None,
             'symmetry_factor': float(symmetry_factor),
             'n_in': len(input_species),
             'n_out': len(output_species),
@@ -428,17 +523,106 @@ class BEST:
             'nitn': nitn,
             'alpha': alpha,
         }
+        if cp_conjugate is not None:
+            self._check_pair(name, config, cp_conjugate)
+        old = self.process_configs.get(name)
+        if old is not None and old['cp_conjugate'] is not None:      # re-registered: the old link goes
+            self.process_configs[old['cp_conjugate']]['cp_conjugate'] = None
+            if self.world_rank == 0:
+                print(f"Process {name} re-registered: no longer the CP conjugate of {old['cp_conjugate']}")
+        self.process_configs[name] = config
         for species in input_species + output_species:
             if species not in self.species_config:
                 self.species_config[species] = 'boson'
                 self.species_mass[species] = 0.0
+        if cp_conjugate is not None:
+            config['cp_conjugate'], self.process_configs[cp_conjugate]['cp_conjugate'] = cp_conjugate, name
         if self.world_rank == 0:
             print(f"Added process {name}: {input_species} -> {output_species} "
                   f"(neval={neval}, nitn={nitn}, "
-                  f"symmetry_factor={symmetry_factor:g})")
+                  f"symmetry_factor={symmetry_factor:g})"
+                  + (f", CP conjugate of {cp_conjugate}" if cp_conjugate is not None else "")
+                  + (", own reverse |M|^2" if mesq_backward is not None else ""))
 
-    def set_species(self, name, stat='boson', mass=0.0, dof=1):
+    def _check_pair(self, name, config, conjugate):
+        """The structure a CP-conjugate pair must have to be integrated on shared
+        samples slot by slot (see add_process); raises ValueError otherwise."""
+        if conjugate == name:
+            raise ValueError(f"{name}: a process is not its own CP conjugate; a reverse direction that is the "
+                             "CP conjugate of the forward one takes mesq_backward")
+        if conjugate not in self.process_configs:
+            raise ValueError(f"{name}: CP-conjugate process '{conjugate}' is not registered")
+        a, b = config, self.process_configs[conjugate]
+        if (a['mesq_backward'] is None) != (b['mesq_backward'] is None):
+            raise ValueError(f"{name}, {conjugate}: a CP-conjugate pair gives its reverse |M|^2 for both members "
+                             "or for neither (without it, each one's reverse is the other's forward |M|^2)")
+        if b['cp_conjugate'] not in (None, name):
+            raise ValueError(f"{conjugate} is already the CP conjugate of {b['cp_conjugate']}")
+        if any(a[k] != b[k] for k in ('neval', 'nitn', 'alpha')):
+            raise ValueError(f"{name}, {conjugate}: a CP-conjugate pair is one integration; neval, nitn and alpha must agree")
+        legs_a, legs_b = a['input'] + a['output'], b['input'] + b['output']
+        missing = [s for s in legs_a + legs_b if s not in self.r_grids]
+        if missing:
+            raise ValueError(f"{name}, {conjugate}: initialize the species before registering a CP-conjugate pair "
+                             f"(not initialized: {', '.join(dict.fromkeys(missing))})")
+        same = (a['n_in'] == b['n_in'] and a['n_out'] == b['n_out'] and a['symmetry_factor'] == b['symmetry_factor']
+                and all(self.species_mass[x] == self.species_mass[y]
+                        and self.species_config[x] == self.species_config[y]
+                        and self.species_dof[x] == self.species_dof[y]
+                        and np.array_equal(self.r_grids[x], self.r_grids[y])
+                        for x, y in zip(legs_a, legs_b))
+                # identical particles in the same slots (the partner's species at a slot
+                # is booked with the multiplicity of ours)
+                and all((legs_a[i] == legs_a[j]) == (legs_b[i] == legs_b[j])
+                        for i in range(len(legs_a)) for j in range(i)))
+        if not same:
+            raise ValueError(f"{name} and {conjugate}: CP-conjugate processes must have the same legs slot by slot "
+                             "(species of the same mass, statistics, dof and grid, identical particles in the same slots)")
+        for x, y in zip(legs_a, legs_b):
+            if self.species_antiparticle.get(x, y) != y or self.species_antiparticle.get(y, x) != x:
+                raise ValueError(f"{name} and {conjugate}: {y} is not the antiparticle of {x} "
+                                 f"(declared: {self.species_antiparticle.get(x)} and {self.species_antiparticle.get(y)})")
+
+    def _reverse_matrix_element(self, process_name):
+        """|M|^2 of the reverse direction of a process (see add_process)."""
+        config = self.process_configs[process_name]
+        if config['mesq_backward'] is not None:
+            return config['mesq_backward']
+        if config['cp_conjugate'] is not None:
+            return self.process_configs[config['cp_conjugate']]['matrix_element_squared']
+        return config['matrix_element_squared']
+
+    def add_custom_term(self, name, func, jacobian=None):
+        """Register a collision term given directly on the grid.
+
+        func(solver) -> {species: (gain, loss)}: the two terms of C = gain - loss
+        on that species' grid, evaluated at solver.distributions_1d (both are
+        rates, loss proportional to f). It takes part in every rate pass, in the
+        exponential steppers (A = gain/(1 + eta f), Gamma = loss/f) and in the
+        seeding of empty species, like a process.
+        jacobian(solver) -> {species: {species2: matrix}} with d C_species / d f_species2;
+        without it the full-Jacobian step uses -loss/f on the diagonal.
+        """
+        self.custom_terms[name] = (func, jacobian)
+        if self.world_rank == 0:
+            print(f"Added custom term {name}" + ("" if jacobian is None else " (with Jacobian)"))
+
+    def _declare_antiparticle(self, species, antiparticle):
+        """Record species <-> antiparticle both ways (UFO convention: a self-conjugate
+        species is its own antiparticle); a contradiction with an earlier declaration
+        is an error."""
+        pairs = ((species, antiparticle), (antiparticle, species))
+        for x, y in pairs:
+            if self.species_antiparticle.get(x, y) != y:
+                raise ValueError(f"{x}: antiparticle declared as {antiparticle if x == species else species}, "
+                                 f"but it was {self.species_antiparticle[x]} before")
+        for x, y in pairs:
+            self.species_antiparticle[x] = y
+
+    def set_species(self, name, stat='boson', mass=0.0, dof=1, antiparticle=None):
         """Set species statistics and mass."""
+        if antiparticle is not None:
+            self._declare_antiparticle(name, antiparticle)
         self.species_config[name] = stat
         self.species_mass[name] = mass
         self.species_dof = getattr(self, 'species_dof', {})
@@ -450,7 +634,7 @@ class BEST:
     # Species initialization
     # ------------------------------------------------------------------
     def initialize_species(self, species, init_func, grid='log',
-                           stat='boson', mass=0.0, dof=None):
+                           stat='boson', mass=0.0, dof=None, antiparticle=None):
         """Initialize species distribution on a fixed grid.
         grid: 'log' or 'linear'.
         init_func: a callable f(q), a pair of arrays (q_tab, f_tab), or the path of
@@ -459,9 +643,14 @@ class BEST:
         extrapolating interpolator. An all-zero distribution is seeded from its
         production spectrum at the first evolve_step.
         dof: internal degrees of freedom (default 2 for a fermion, 1 for a boson;
-        give it explicitly for a complex scalar, a vector, ...)."""
+        give it explicitly for a complex scalar, a vector, ...).
+        antiparticle: the name of the antiparticle species (its own name for a
+        self-conjugate species, as in the UFO format); recorded both ways and used
+        to check CP-conjugate pairs of processes (add_process(..., cp_conjugate=))."""
         if species in ('times', 'a'):
             raise ValueError(f"'{species}' is a key of the history dict; use another species name")
+        if antiparticle is not None:
+            self._declare_antiparticle(species, antiparticle)
         if isinstance(init_func, str):
             init_func = tuple(np.loadtxt(init_func, comments='#',
                                          delimiter=',' if init_func.endswith('.csv') else None).T[:2])
@@ -502,7 +691,8 @@ class BEST:
             n = np.trapezoid(f_values * self.r_grids[species]**2,
                              self.r_grids[species]) * dof / (2 * np.pi**2)
             print(f"Initialized {species} ({stat}, m={mass}, grid={grid}): "
-                  f"n = {n:.3e}")
+                  f"n = {n:.3e}"
+                  + (f", antiparticle {antiparticle}" if antiparticle is not None else ""))
             if mass == 0.0:
                 print(f"  note: {species} is massless; its collision rates grow as 1/E towards the "
                       f"infrared (with the Bose enhancement on top for a boson), so the softest modes "
@@ -517,9 +707,9 @@ class BEST:
     # ------------------------------------------------------------------
     # Vegas integrator setup
     # ------------------------------------------------------------------
-    def setup_collision_integrator(self, process_name, section=None, mode='net'):
+    def setup_collision_integrator(self, process_name, section=None, mode='net', key_name=None):
         suffix = getattr(self, '_integrator_suffix', '')
-        proc_key = process_name + suffix
+        proc_key = (process_name if key_name is None else key_name) + suffix
 
         if proc_key not in self.vegas_integrators:
             self.vegas_integrators[proc_key] = {}
@@ -596,6 +786,23 @@ class BEST:
         p_hi = min(np.sqrt(max(E_hi**2 - m_s**2, 0.0)), p_max)
         return (p_lo, p_hi) if p_hi > p_lo else None
 
+    def _target_slot(self, config, target_species):
+        """Slot of the observed species in a process and the sign of its side
+        (+1 input, -1 output): the side forced by _force_target_side, else the
+        side with more particles, else the input side."""
+        input_species, output_species = config['input'], config['output']
+        n_in, n_out = config['n_in'], config['n_out']
+        force = getattr(self, '_force_target_side', None)
+        if force == 'input' and target_species in input_species:
+            return input_species.index(target_species), 1
+        if force == 'output' and target_species in output_species:
+            return n_in + output_species.index(target_species), -1
+        if n_out > n_in and target_species in output_species:
+            return n_in + output_species.index(target_species), -1
+        if target_species in input_species:
+            return input_species.index(target_species), 1
+        return n_in + output_species.index(target_species), -1
+
     # ------------------------------------------------------------------
     # Batch collision integrand (core)
     # ------------------------------------------------------------------
@@ -610,28 +817,22 @@ class BEST:
         n_total = n_in + n_out
 
 
-        # Place target on the side with more particles
-        force = getattr(self, '_force_target_side', None)
-        if force == 'input' and target_species in input_species:
-            target_idx = input_species.index(target_species)
-            sign = 1
-        elif force == 'output' and target_species in output_species:
-            target_idx = n_in + output_species.index(target_species)
-            sign = -1
-        elif n_out > n_in and target_species in output_species:
-            target_idx = n_in + output_species.index(target_species)
-            sign = -1
-        elif target_species in input_species:
-            target_idx = input_species.index(target_species)
-            sign = 1
-        else:
-            target_idx = n_in + output_species.index(target_species)
-            sign = -1
+        target_idx, sign = self._target_slot(config, target_species)
 
         stats = [self.species_config[s] for s in all_species]
         interps = {s: self.interpolators[s] for s in set(all_species)}
         matrix_element_squared = config['matrix_element_squared']
+        matrix_element_squared_bwd = self._reverse_matrix_element(process_name)
         symmetry_factor = config['symmetry_factor']
+        # CP-conjugate partner: the same legs slot by slot, evaluated on the same
+        # samples with its own forward and reverse |M|^2 (by default our reverse and
+        # forward ones, CPT)
+        partner = config['cp_conjugate']
+        if partner is not None:
+            all_species_p = self.process_configs[partner]['input'] + self.process_configs[partner]['output']
+            interps_p = {s_: self.interpolators[s_] for s_ in set(all_species_p)}
+            matrix_element_squared_p = self.process_configs[partner]['matrix_element_squared']
+            matrix_element_squared_bwd_p = self._reverse_matrix_element(partner)
         cutoff_e = self.cutoff_energy_min
         rate_flush = self.rate_flush
         vegas_mod = self._vegas
@@ -648,26 +849,63 @@ class BEST:
             y[np.abs(y) < rate_flush] = 0.0
             return y
 
-        def _pack(FW, BW, common, f_arr=None, q_com_legs=None, wgt=None):
+        def _columns(FW, BW, cf, cb):
+            # the two directions of one process on common samples; cf, cb carry
+            # the forward and reverse |M|^2 (the same object under T invariance)
+            if cb is cf:
+                return _flush(FW * cf), _flush(BW * cf), _flush((FW + BW) * cf)
+            return _flush(FW * cf), _flush(BW * cb), _flush(FW * cf + BW * cb)
+
+        def _weights(momenta, measure, E_t, bad=None):
+            """Sample weights sign g |M|^2 sym measure / (2 E_t) of the forward and
+            reverse direction of this process and, with a partner, of the partner's;
+            equal functions share one array (the T-invariant and the CPT cases need
+            two evaluations of |M|^2, four different functions need four)."""
+            built = {}
+            def weight(func):
+                if id(func) not in built:
+                    arr = sign * g_factor * (func(momenta) * symmetry_factor) * measure / (2.0 * E_t)
+                    if bad is not None:
+                        arr[bad] = 0.0
+                    built[id(func)] = arr
+                return built[id(func)]
+            cf, cb = weight(matrix_element_squared), weight(matrix_element_squared_bwd)
+            if partner is None:
+                return cf, cb, None, None
+            return cf, cb, weight(matrix_element_squared_p), weight(matrix_element_squared_bwd_p)
+
+        def _pack(FW, BW, cf, cb, f_arr=None, q_com_legs=None, wgt=None, FWp=None, BWp=None, f_arr_p=None, cfp=None, cbp=None):
             if mode == 'jacobian':
                 # weighted row sum_samples wgt * d(net)/d f_s(q_i), accumulated
-                # outside vegas on the adapted map (see compute_collision_rate)
-                acc = np.zeros(n_cols)
-                _jacobian(acc, f_arr, q_com_legs, _flush(common * wgt))
+                # outside vegas on the adapted map (see compute_collision_rate);
+                # with a partner its row follows ours (2 n_cols)
+                acc = np.zeros((2, n_cols if partner is None else 2 * n_cols))   # [sum of contributions, sum of squares]
+                weighted = {}
+                def wgt_of(c):
+                    if id(c) not in weighted:
+                        weighted[id(c)] = _flush(c * wgt)
+                    return weighted[id(c)]
+                _jacobian(acc[:, :n_cols], f_arr, q_com_legs, wgt_of(cf), wgt_of(cb), all_species, target_species)
+                if partner is not None:
+                    _jacobian(acc[:, n_cols:], f_arr_p, q_com_legs, wgt_of(cfp), wgt_of(cbp), all_species_p, all_species_p[target_idx])
                 return acc
+            fw, bw, both = _columns(FW, BW, cf, cb)
+            if partner is not None:
+                fwp, bwp, bothp = _columns(FWp, BWp, cfp, cbp)
             if mode == 'joint':
-                # same samples for FW and BW; vegas adapts to column 0 = FW + BW,
-                # columns 1, 2 are the estimates actually used
-                out = np.zeros((FW.size, 3))
-                out[:, 0] = _flush((FW + BW) * common)
-                out[:, 1] = _flush(FW * common)
-                out[:, 2] = _flush(BW * common)
-                return out
+                # same samples for FW and BW; vegas adapts to column 0 = FW + BW
+                # (the CP-even sum over the pair), the other columns are the
+                # estimates actually used
+                if partner is None:
+                    return np.stack([both, fw, bw], axis=1)
+                return np.stack([both + bothp, fw, bw, fwp, bwp], axis=1)
             if mode == 'forward':
-                return _flush(FW * common)
+                return fw if partner is None else np.stack([fw + fwp, fw, fwp], axis=1)
             if mode == 'backward':
-                return _flush(BW * common)
-            return _flush((BW - FW) * common)
+                return bw if partner is None else np.stack([bw + bwp, bw, bwp], axis=1)
+            if partner is None:
+                return _flush((BW - FW) * cf) if cb is cf else bw - fw
+            return np.stack([bw - fw + bwp - fwp, bw - fw, bwp - fwp], axis=1)
 
         eta = np.array([1.0 if st == 'boson' else (-1.0 if st == 'fermion' else 0.0) for st in stats])
 
@@ -699,23 +937,28 @@ class BEST:
             w1 = (x - lg[i0]) / (lg[i1] - lg[i0]); w0 = 1.0 - w1
             return i0, i1, w0, w1
 
-        def _add_J(acc, k_leg, dval, q_com):
-            """Add sum_samples wgt * d(net)/d f_leg * w_node into the nodes of leg k.
+        def _add_J(acc, sp_, dval, q_com):
+            """Add sum_samples wgt * d(net)/d f_leg * w_node into the nodes of a leg.
             A species outside species_list is prescribed (it does not evolve), so
             its nodes have no columns and its legs contribute nothing."""
-            sp_ = all_species[k_leg]
             if sp_ not in J_offset:
                 return
             i0, i1, w0, w1 = _node_weights(sp_, q_com)
-            np.add.at(acc, J_offset[sp_] + i0, dval * w0)
-            np.add.at(acc, J_offset[sp_] + i1, dval * w1)
+            np.add.at(acc[0], J_offset[sp_] + i0, dval * w0)
+            np.add.at(acc[0], J_offset[sp_] + i1, dval * w1)
+            np.add.at(acc[1], J_offset[sp_] + i0, (dval * w0) ** 2)
+            np.add.at(acc[1], J_offset[sp_] + i1, (dval * w1) ** 2)
 
-        def _jacobian(acc, f_arr, q_com_legs, common):
-            """Accumulate the weighted Jacobian row into `acc` (n_cols,); `common`
-            already carries the sample weights. q_com_legs[k]: comoving momentum of
-            leg k (None for the target: its own node, weight 1)."""
+        def _jacobian(acc, f_arr, q_com_legs, common_f, common_b, legs, target_sp):
+            """Accumulate the weighted Jacobian row into `acc` (2, n_cols): the row
+            sum and the sum of squares of the sample contributions; common_f
+            and common_b carry the sample weights and the |M|^2 of the forward and
+            reverse direction. q_com_legs[k]: comoving momentum of leg k (None for
+            the target: its own node, weight 1). legs: the species of the legs."""
+            if target_sp not in J_offset:
+                return
             for k in range(n_total):
-                FWk = np.ones(common.size); BWk = np.ones(common.size)
+                FWk = np.ones(common_f.size); BWk = np.ones(common_f.size)
                 for j in range(n_total):
                     if j == k:
                         continue
@@ -729,11 +972,12 @@ class BEST:
                     dFW, dBW = FWk, eta[k] * BWk
                 else:
                     dBW, dFW = BWk, eta[k] * FWk
-                dnet = (dBW - dFW) * common
+                dnet = (dBW - dFW) * common_f if common_b is common_f else dBW * common_b - dFW * common_f
                 if k == target_idx:
-                    acc[J_offset[target_species] + target_node] += dnet.sum()
+                    acc[0, J_offset[target_sp] + target_node] += dnet.sum()
+                    acc[1, J_offset[target_sp] + target_node] += (dnet ** 2).sum()
                 else:
-                    _add_J(acc, k, dnet, q_com_legs[k])
+                    _add_J(acc, legs[k], dnet, q_com_legs[k])
 
         def _statistics(f_arr, N):
             # FW: product of the initial-state f times the final-state (1 + eta f);
@@ -802,14 +1046,21 @@ class BEST:
                 f_arr[s_idx] = np.clip(interps[all_species[s_idx]](np.where(valid, p_s, p_fill) * a), 0, None)
                 f_arr[c_idx] = np.clip(interps[all_species[c_idx]](np.where(valid, p_c, p_fill) * a), 0, None)
                 FW, BW = _statistics(f_arr, N)
-
-                M_sq = matrix_element_squared(np.stack([mom_x, mom_y, mom_z], axis=1)) * symmetry_factor
-                measure = np.where(valid, E_s * log_range / (8.0 * np.pi * p_t), 0.0)   # dE_s/(8 pi p_t)
-                common = sign * g_factor * M_sq * measure / (2.0 * E_t)
                 q_legs = [None] * n_total
                 q_legs[s_idx] = np.where(valid, p_s, p_fill) * a
                 q_legs[c_idx] = np.where(valid, p_c, p_fill) * a
-                return _pack(FW, BW, common, f_arr, q_legs, wgt)
+
+                momenta = np.stack([mom_x, mom_y, mom_z], axis=1)
+                measure = np.where(valid, E_s * log_range / (8.0 * np.pi * p_t), 0.0)   # dE_s/(8 pi p_t)
+                common, common_b, common_fp, common_bp = _weights(momenta, measure, E_t)
+                if partner is None:
+                    return _pack(FW, BW, common, common_b, f_arr, q_legs, wgt)
+                f_arr_p = [None] * n_total
+                f_arr_p[target_idx] = np.clip(interps_p[all_species_p[target_idx]](np.full(N, q1_mag)), 0, None)
+                f_arr_p[s_idx] = np.clip(interps_p[all_species_p[s_idx]](q_legs[s_idx]), 0, None)
+                f_arr_p[c_idx] = np.clip(interps_p[all_species_p[c_idx]](q_legs[c_idx]), 0, None)
+                FWp, BWp = _statistics(f_arr_p, N)
+                return _pack(FW, BW, common, common_b, f_arr, q_legs, wgt, FWp, BWp, f_arr_p, common_fp, common_bp)
 
             return integrand_two_body
 
@@ -922,13 +1173,20 @@ class BEST:
             f_arr[c_idx] = np.clip(interps[all_species[c_idx]](q_legs[c_idx]), 0, None)
             FW, BW = _statistics(f_arr, N)
 
-            M_sq = matrix_element_squared(np.stack([mom_x, mom_y, mom_z], axis=1)) * symmetry_factor
-            common = sign * g_factor * M_sq * measure / (2.0 * E_t)
+            momenta = np.stack([mom_x, mom_y, mom_z], axis=1)
             bad = np.zeros(N, dtype=bool)
             for k in range(n_total):
                 bad |= (energies[k] < cutoff_e)
-            common[bad] = 0.0
-            return _pack(FW, BW, common, f_arr, q_legs, wgt)
+            common, common_b, common_fp, common_bp = _weights(momenta, measure, E_t, bad)
+            if partner is None:
+                return _pack(FW, BW, common, common_b, f_arr, q_legs, wgt)
+            f_arr_p = [None] * n_total
+            f_arr_p[target_idx] = np.clip(interps_p[all_species_p[target_idx]](np.full(N, q1_mag)), 0, None)
+            for k in range(n_total):
+                if k != target_idx:
+                    f_arr_p[k] = np.clip(interps_p[all_species_p[k]](q_legs[k]), 0, None)
+            FWp, BWp = _statistics(f_arr_p, N)
+            return _pack(FW, BW, common, common_b, f_arr, q_legs, wgt, FWp, BWp, f_arr_p, common_fp, common_bp)
 
         return integrand_exact
 
@@ -938,31 +1196,72 @@ class BEST:
     # ------------------------------------------------------------------
     def compute_collision_rate(self, r_target, species, active_processes,
                             r_index=0, t=0.0):
-
-        total_rate = 0.0
-        total_forward = 0.0
-        total_backward = 0.0
+        """Rates of the observed species at one grid point from the active
+        processes. Returns {(species, process): (net, forward, backward, J_row or
+        None)}; a process with a CP-conjugate partner adds the partner's species
+        at the same slot, integrated on the same samples."""
         want_J = getattr(self, '_want_jacobian', False)
-        total_J = np.zeros(self._n_jacobian_cols()) if want_J else None
+        n_J = self._n_jacobian_cols() if want_J else 0
+        totals = {}
+
+        def accumulate(sp, proc, result_f, result_b, J_row):
+            tot = totals.setdefault((sp, proc), [0.0, 0.0, 0.0, np.zeros(n_J) if want_J else None])
+            tot[0] += result_b.mean - result_f.mean
+            tot[1] += result_f.mean
+            tot[2] += result_b.mean
+            if want_J:
+                tot[3] += J_row
+
+        def rel_err(result):
+            return result.sdev / abs(result.mean) if result.mean != 0 else np.inf
+
+        def integrate(integrator, batch, nitn, neval, alpha):
+            res = integrator(batch, nitn=nitn, neval=neval, alpha=alpha)
+            # vegas combines the iterations, and already a single one, through the
+            # inverse covariance of the columns, which is singular (the sum column)
+            # and nearly singular for the two directions on common samples; the SVD
+            # cut that guards the inverse drops the near-degenerate direction, and
+            # the reconstructed columns leave their common-sample estimate by an
+            # amount set by their covariance under the map, not by the samples: on
+            # a map adapted at a neighbouring node (a group integrating a block of
+            # nodes) this reaches 1e-3 of the rate, as a drift of the conserved
+            # numbers (Mdecay, 1.3.1). The iterations' own estimates are combined
+            # instead with one weight per iteration, the inverse variance of the
+            # sum column (the CP-even sum of a pair), so that every column is
+            # combined alike and the directions stay on common samples.
+            results = res.itn_results
+            sdevs = [(r[0] if np.ndim(r) else r).sdev for r in results]
+            weights = [1.0 / sd**2 for sd in sdevs] if min(sdevs) > 0.0 else [1.0] * len(results)
+            total = weights[0] * results[0]
+            for w, r in zip(weights[1:], results[1:]):
+                total = total + w * r
+            return total / sum(weights)
 
         for process_name in active_processes:
             config = self.process_configs[process_name]
-            if species not in config['input'] + config['output']:
+            if species not in config['input'] + config['output'] or (species, process_name) in totals:
                 continue
 
             section = self.color
             neval = config.get('neval', 1000)
             nitn  = config.get('nitn', 2)
             alpha = config.get('alpha', 0.5)
-            key = process_name + getattr(self, '_integrator_suffix', '')
+            partner = config['cp_conjugate']
+            key_name = process_name if partner is None else min(process_name, partner)
+            key = key_name + getattr(self, '_integrator_suffix', '')
+            # (species, process) of every column pair returned by the integrand
+            members = [(species, process_name)]
+            if partner is not None:
+                slot, _ = self._target_slot(config, species)
+                members.append(((self.process_configs[partner]['input'] + self.process_configs[partner]['output'])[slot], partner))
 
             # ---- joint pass ----
-            integrator_j = self.setup_collision_integrator(process_name, section, 'joint')
+            integrator_j = self.setup_collision_integrator(process_name, section, 'joint', key_name=key_name)
             batch_j = self.collision_integrand_batch(
                 process_name, species, r_target, mode='joint', t=t)
-            res = integrator_j(batch_j, nitn=nitn, neval=neval, alpha=alpha)
-            result_f, result_b = res[1], res[2]          # correlated gvars
-            result_b_dir = None
+            res = integrate(integrator_j, batch_j, nitn, neval, alpha)
+            results = [(res[1 + 2 * m], res[2 + 2 * m]) for m in range(len(members))]   # correlated gvars
+            J_rows = [None] * len(members)
             if want_J:
                 # Jacobian row on the adapted map, accumulated in chunks so that the
                 # (samples x nodes) block never exists as one array
@@ -971,37 +1270,62 @@ class BEST:
                 # and summed over the group
                 batch_J = self.collision_integrand_batch(
                     process_name, species, r_target, mode='jacobian', t=t)
-                J_part = np.zeros(self._n_jacobian_cols())
+                J_part = np.zeros((2, n_J * len(members)))
+                n_samp = 0
                 for b_i, (x, wgt) in enumerate(integrator_j.random_batch()):
+                    n_samp += x.shape[0]
                     if b_i % self.sub_size == self.sub_rank:
                         J_part += batch_J(x, wgt)
-                J_row = np.zeros_like(J_part)
-                self.sub_comm.Allreduce(J_part, J_row, op=MPI.SUM)
+                J_all = np.zeros_like(J_part)
+                self.sub_comm.Allreduce(J_part, J_all, op=MPI.SUM)
+                # per-entry Monte Carlo error of the row sum (importance sampling):
+                # var(sum) ~ sum c^2 - (sum c)^2 / N; an entry that is not resolved
+                # (|J| < J_SIG * sigma, the rate QC rule at J_SIG = 1) is set to 0
+                J_sig = float(getattr(self, 'J_SIG', 0.0))
+                J_rows = []
+                for m in range(len(members)):
+                    cols = slice(m * n_J, (m + 1) * n_J)
+                    row = J_all[0, cols]
+                    if J_sig > 0.0:
+                        var = np.maximum(J_all[1, cols] - row ** 2 / max(n_samp, 1), 0.0)
+                        keep = np.abs(row) >= J_sig * np.sqrt(var)
+                        self.error_stats['J_zeroed'] = self.error_stats.get('J_zeroed', 0) + int((~keep & (row != 0)).sum())
+                        self.error_stats['J_kept'] = self.error_stats.get('J_kept', 0) + int(keep.sum())
+                        row = np.where(keep, row, 0.0)
+                    J_rows.append(row)
 
             # ---- fallback: BW on its own map; chosen by variance ----
-            rel_b = result_b.sdev / abs(result_b.mean) if result_b.mean != 0 else np.inf
-            if rel_b > self.bw_fallback_rel_err:
-                integrator_b = self.setup_collision_integrator(process_name, section, 'backward')
+            # One decision per integration, on the sum over the members: a pair is
+            # replaced, kept, zeroed or dropped as a whole, so that its members
+            # stay on common samples
+            rf_all, rb_all = results[0] if partner is None else (results[0][0] + results[1][0], results[0][1] + results[1][1])
+            direct = None
+            if rel_err(rb_all) > self.bw_fallback_rel_err:
+                integrator_b = self.setup_collision_integrator(process_name, section, 'backward', key_name=key_name)
                 batch_b = self.collision_integrand_batch(
                     process_name, species, r_target, mode='backward', t=t)
-                result_b_dir = integrator_b(batch_b, nitn=nitn, neval=neval, alpha=alpha)
-                if result_b_dir.sdev < result_b.sdev:
-                    result_b = result_b_dir
+                res_b = integrate(integrator_b, batch_b, nitn, neval, alpha)
+                direct = [res_b] if partner is None else [res_b[1 + m] for m in range(len(members))]
+                rb_direct = res_b if partner is None else res_b[0]
+                if rb_direct.sdev < rb_all.sdev:
+                    results = [(rf, d) for (rf, _), d in zip(results, direct)]
+                    rb_all = rb_direct
                     self.error_stats['bw_fallback'] = self.error_stats.get('bw_fallback', 0) + 1
 
             if self.verbose and self.world_rank == 0:
-                print(f"      [{key} r={r_index}] FW={result_f}  BW_joint={res[2]}"
-                      + (f"  BW_direct={result_b_dir}" if result_b_dir is not None else ""))
+                for m, ((sp, proc), (result_f, _)) in enumerate(zip(members, results)):
+                    print(f"      [{proc}{getattr(self, '_integrator_suffix', '')} r={r_index}] {sp}: FW={result_f}  BW_joint={res[2 + 2 * m]}"
+                          + (f"  BW_direct={direct[m]}" if direct is not None else ""))
 
             # ---- quality control ----
             # A point is neglected only when both directions vanish. FW alone can be
             # exactly zero for an empty species in the input slot (f1 f2 underflows)
             # while the gain (BW) is finite: that gain must be kept.
-            if result_f.mean == 0 and result_b.mean == 0:
+            if rf_all.mean == 0 and rb_all.mean == 0:
                 self.error_stats['neglected'] += 1
                 continue
-            if result_f.mean != 0:
-                rel_f = result_f.sdev / abs(result_f.mean)
+            if rf_all.mean != 0:
+                rel_f = rel_err(rf_all)
                 self.error_stats.setdefault('rel_errs', []).append(rel_f)
                 if rel_f > 1.0:
                     self.error_stats['dropped'] += 1
@@ -1009,11 +1333,12 @@ class BEST:
                         print(f"      [drop] {key} r_index={r_index} rel_err_f={rel_f:.2f}")
                     continue
 
-            rel_b = result_b.sdev / abs(result_b.mean) if result_b.mean != 0 else np.inf
+            rel_b = rel_err(rb_all)
+            zero_b = False
             if rel_b > 1.0:
-                if abs(result_b.mean) + result_b.sdev <= abs(result_f.mean):
+                if abs(rb_all.mean) + rb_all.sdev <= abs(rf_all.mean):
                     # subdominant even at +1 sigma: gain -> 0, measured loss kept
-                    result_b = 0.0 * result_b
+                    zero_b = True
                     self.error_stats['bw_zeroed'] = self.error_stats.get('bw_zeroed', 0) + 1
                 else:
                     # possibly dominant and unmeasurable: hold the mode and say so
@@ -1022,19 +1347,20 @@ class BEST:
                         print(f"      [drop] {key} r_index={r_index} "
                               f"BW unmeasurable rel_err_b={rel_b:.2f}")
                     continue
+            for m, ((sp, proc), (result_f, result_b)) in enumerate(zip(members, results)):
+                accumulate(sp, proc, result_f, 0.0 * result_b if zero_b else result_b, J_rows[m])
 
-            total_rate     += result_b.mean - result_f.mean
-            total_forward  += result_f.mean
-            total_backward += result_b.mean
-            if want_J:
-                total_J += J_row
-
-        if want_J:
-            return total_rate, total_forward, total_backward, total_J
-        return total_rate, total_forward, total_backward
+        return totals
 
     def _n_jacobian_cols(self):
         return sum(len(self.r_grids[sp]) for sp in self.species_list)
+
+    def _jacobian_offsets(self):
+        offsets, off = {}, 0
+        for sp in self.species_list:
+            offsets[sp] = off
+            off += len(self.r_grids[sp])
+        return offsets
 
     # ------------------------------------------------------------------
     # Rate computation over grid (Vegas)
@@ -1047,7 +1373,9 @@ class BEST:
         Returns (species_rates, species_forward, species_backward) where
         forward/backward are the signed reaction-direction rates (sign folded
         in via the integrand). _compute_rates_vegas turns these into physical
-        per-slot gain/loss.
+        per-slot gain/loss. The dicts are keyed by (species, process); a process
+        with a CP-conjugate partner also returns the partner's species at the
+        observed slot (same samples, same grid) under the partner's name.
         """
         for s, func in self.species_mass_func.items():
             self.species_mass[s] = func(t)
@@ -1065,12 +1393,20 @@ class BEST:
                       f"via {', '.join(active_processes)}:")
                 print(f"    Grid points: {len(self.r_grids[species])}", flush=True)
 
+            # species whose rates this pass produces: the observed one and, for a
+            # process with a conjugate partner, the partner's species at the slot
+            out_keys = [(species, p) for p in active_processes]
+            for p in active_processes:
+                config = self.process_configs[p]
+                if config['cp_conjugate'] is not None and species in config['input'] + config['output']:
+                    slot, _ = self._target_slot(config, species)
+                    cp = self.process_configs[config['cp_conjugate']]
+                    out_keys.append(((cp['input'] + cp['output'])[slot], config['cp_conjugate']))
+
             n_r = len(self.r_grids[species])
-            rates_local = np.zeros_like(self.r_grids[species])
-            fwd_local = np.zeros_like(rates_local)
-            bwd_local = np.zeros_like(rates_local)
             want_J = getattr(self, '_want_jacobian', False)
-            J_local = np.zeros((n_r, self._n_jacobian_cols())) if want_J else None
+            local = {key: [np.zeros(n_r), np.zeros(n_r), np.zeros(n_r),
+                           np.zeros((n_r, self._n_jacobian_cols())) if want_J else None] for key in out_keys}
 
             block_size = n_r // self.n_r_parallel
             remainder = n_r % self.n_r_parallel
@@ -1087,9 +1423,11 @@ class BEST:
                     continue
                 res_i = self.compute_collision_rate(
                     r, species, active_processes, r_index=i, t=t)
-                rates_local[i], fwd_local[i], bwd_local[i] = res_i[:3]
-                if want_J:
-                    J_local[i] = res_i[3]
+                for key_, tot in res_i.items():
+                    arrays = local[key_]
+                    arrays[0][i], arrays[1][i], arrays[2][i] = tot[:3]
+                    if want_J:
+                        arrays[3][i] = tot[3]
                 if (self.sub_rank == 0
                         and (idx + 1) % max(1, len(my_r_indices) // 5) == 0):
                     elapsed = time.time() - t_sp
@@ -1102,30 +1440,32 @@ class BEST:
                               f"({idx+1}/{len(my_r_indices)}), "
                               f"ETA={eta:.0f}s", flush=True)
 
-            if self.sub_rank != 0:
-                rates_local[:] = 0.0
-                fwd_local[:] = 0.0
-                bwd_local[:] = 0.0
-                if want_J:
-                    J_local[:] = 0.0
+            for key_ in out_keys:
+                rates_local, fwd_local, bwd_local, J_local = local[key_]
+                if self.sub_rank != 0:
+                    rates_local[:] = 0.0
+                    fwd_local[:] = 0.0
+                    bwd_local[:] = 0.0
+                    if want_J:
+                        J_local[:] = 0.0
 
-            rates = np.zeros_like(rates_local)
-            fwd = np.zeros_like(fwd_local)
-            bwd = np.zeros_like(bwd_local)
-            self.world_comm.Allreduce(rates_local, rates, op=MPI.SUM)
-            self.world_comm.Allreduce(fwd_local, fwd, op=MPI.SUM)
-            self.world_comm.Allreduce(bwd_local, bwd, op=MPI.SUM)
-            species_rates[species] = rates
-            species_forward[species] = fwd
-            species_backward[species] = bwd
-            if want_J:
-                J_all = np.zeros_like(J_local)
-                self.world_comm.Allreduce(J_local, J_all, op=MPI.SUM)
-                self._pass_jacobian[species] = J_all
+                rates = np.zeros_like(rates_local)
+                fwd = np.zeros_like(fwd_local)
+                bwd = np.zeros_like(bwd_local)
+                self.world_comm.Allreduce(rates_local, rates, op=MPI.SUM)
+                self.world_comm.Allreduce(fwd_local, fwd, op=MPI.SUM)
+                self.world_comm.Allreduce(bwd_local, bwd, op=MPI.SUM)
+                species_rates[key_] = rates
+                species_forward[key_] = fwd
+                species_backward[key_] = bwd
+                if want_J:
+                    J_all = np.zeros_like(J_local)
+                    self.world_comm.Allreduce(J_local, J_all, op=MPI.SUM)
+                    self._pass_jacobian[key_] = J_all
 
             if self.world_rank == 0:
                 print(f"    [Vegas] done in {time.time()-t_sp:.1f}s, "
-                      f"max|C|={np.max(np.abs(rates)):.3e}")
+                      f"max|C|={max(np.max(np.abs(species_rates[k_])) for k_ in out_keys):.3e}")
 
         return species_rates, species_forward, species_backward
 
@@ -1154,6 +1494,15 @@ class BEST:
         # Update masses at time t
         for s, func in self.species_mass_func.items():
             self.species_mass[s] = func(t)
+        for name, config in self.process_configs.items():
+            # a pair shares its kinematics: the two species of a slot keep the same mass
+            partner = config['cp_conjugate']
+            if partner is not None and name < partner:
+                cp = self.process_configs[partner]
+                for x, y in zip(config['input'] + config['output'], cp['input'] + cp['output']):
+                    if self.species_mass[x] != self.species_mass[y]:
+                        raise ValueError(f"{name}, {partner}: {x} and {y} of one slot have different masses at "
+                                         f"t = {t} (a mass function given to one of them only?)")
 
         species_rates = {sp: np.zeros_like(self.r_grids[sp])
                          for sp in self.species_list}
@@ -1185,10 +1534,26 @@ class BEST:
             self._pass_jacobian = {}
 
 
-        for process_name in active_processes:
+        def accumulate(process, species, side, n_s, k, kf, kb):
+            # per-slot alignment of the physical gain/loss (see the docstring)
+            key = (species, process)
+            species_rates[species]    += n_s * k[key]
+            if want_J:
+                species_J[species] += n_s * self._pass_jacobian[key]
+            species_forward[species]  += n_s * kf[key]   # original semantics
+            species_backward[species] += n_s * kb[key]
+            gain, loss = (kb[key], kf[key]) if side == 'input' else (-kf[key], -kb[key])
+            species_gain[species]     += n_s * gain
+            species_loss[species]     += n_s * loss
+            species_gain_p[process][species]     += n_s * gain
+            species_loss_p[process][species]     += n_s * loss
+
+        done = set()     # (process, species, side) already integrated with its CP-conjugate partner
+        for process_name in [p for p in active_processes if p in self.process_configs]:
             config = self.process_configs[process_name]
             input_species = config['input']
             output_species = config['output']
+            partner = config['cp_conjugate']
 
             for species in self.species_list:
                 n_in_s = input_species.count(species)
@@ -1199,56 +1564,71 @@ class BEST:
 
                 symmetric = sorted(input_species) == sorted(output_species)
 
+                def book_partner(side, n_s, legs, k, kf, kb):
+                    # the partner's species at the same slot came out of the same
+                    # samples; it is booked under the partner process (same multiplicity)
+                    cp = self.process_configs[partner]
+                    sp_p = (cp['input'] if side == 'input' else cp['output'])[legs.index(species)]
+                    if partner in species_gain_p and sp_p in self.species_list:
+                        accumulate(partner, sp_p, side, n_s, k, kf, kb)
+                    done.add((partner, sp_p, side))
+
                 if n_in_s == n_out_s and symmetric:
-                    # Symmetric process: C_in = C_out by relabeling. Compute once
-                    # (target auto-placed on the input side, sign=+1), multiply by
+                    # A reaction that is its own reverse (l Phi -> l Phi): the pass with the
+                    # target on the input side already counts the target as initial
+                    # (forward, loss) and as final (reverse, gain) particle, so the output
+                    # side would count the same events again; C_in = C_out by relabeling.
+                    # Compute once (target on the input side, sign=+1), multiply by
                     # n_in_s. Input-side alignment: BW=gain, FW=loss.
+                    if (process_name, species, 'input') in done:
+                        continue
                     self._force_target_side = None
                     k, kf, kb = self._compute_rates_single_pass(
                         [process_name], t=t, species_filter=[species])
-                    species_rates[species]    += n_in_s * k[species]
-                    if want_J:
-                        species_J[species] += n_in_s * self._pass_jacobian[species]
-                    species_forward[species]  += n_in_s * kf[species]   # original semantics
-                    species_backward[species] += n_in_s * kb[species]
-                    species_gain[species]     += n_in_s * kb[species]   # input: BW=gain
-                    species_loss[species]     += n_in_s * kf[species]   #        FW=loss
-                    species_gain_p[process_name][species]     += n_in_s * kb[species]
-                    species_loss_p[process_name][species]     += n_in_s * kf[species]
+                    accumulate(process_name, species, 'input', n_in_s, k, kf, kb)
+                    if partner is not None:
+                        book_partner('input', n_in_s, input_species, k, kf, kb)
                 else:
-                    # Asymmetric OR n_in_s != n_out_s: compute each side present.
-                    if n_in_s > 0:
-                        self._integrator_suffix = '_in'
-                        self._force_target_side = 'input'
-                        k_in, kf_in, kb_in = self._compute_rates_single_pass(
+                    # Each side present is computed with the target forced there; the
+                    # per-pass kf, kb carry sign=-1 on the output side, undone in accumulate.
+                    for side, n_s, legs in (('input', n_in_s, input_species), ('output', n_out_s, output_species)):
+                        if n_s == 0 or (process_name, species, side) in done:
+                            continue
+                        self._integrator_suffix = '_in' if side == 'input' else '_out'
+                        self._force_target_side = side
+                        k, kf, kb = self._compute_rates_single_pass(
                             [process_name], t=t, species_filter=[species])
-                        species_rates[species]    += n_in_s * k_in[species]
-                        if want_J:
-                            species_J[species] += n_in_s * self._pass_jacobian[species]
-                        species_forward[species]  += n_in_s * kf_in[species]
-                        species_backward[species] += n_in_s * kb_in[species]
-                        species_gain[species]     += n_in_s * kb_in[species]  # input: BW=gain
-                        species_loss[species]     += n_in_s * kf_in[species]  #        FW=loss
-                        species_gain_p[process_name][species]     += n_in_s * kb_in[species]  # input: BW=gain
-                        species_loss_p[process_name][species]     += n_in_s * kf_in[species]  #        FW=loss
-                    if n_out_s > 0:
-                        self._integrator_suffix = '_out'
-                        self._force_target_side = 'output'
-                        k_out, kf_out, kb_out = self._compute_rates_single_pass(
-                            [process_name], t=t, species_filter=[species])
-                        species_rates[species]    += n_out_s * k_out[species]
-                        if want_J:
-                            species_J[species] += n_out_s * self._pass_jacobian[species]
-                        species_forward[species]  += n_out_s * kf_out[species]   # original semantics
-                        species_backward[species] += n_out_s * kb_out[species]
-                        # output-side: roles FLIP; sign=-1 folded in kf_out,kb_out -> undo
-                        species_gain[species]     += n_out_s * (-kf_out[species])  # FW_out=gain
-                        species_loss[species]     += n_out_s * (-kb_out[species])  # BW_out=loss
-                        species_gain_p[process_name][species]     += n_out_s * (-kf_out[species])  # FW_out=gain
-                        species_loss_p[process_name][species]     += n_out_s * (-kb_out[species])  # BW_out=loss
+                        accumulate(process_name, species, side, n_s, k, kf, kb)
+                        if partner is not None:
+                            book_partner(side, n_s, legs, k, kf, kb)
 
                     self._force_target_side = None
                     self._integrator_suffix = ''
+
+        offsets = self._jacobian_offsets() if want_J else None
+        for name in [p for p in active_processes if p in self.custom_terms]:
+            func, jacobian = self.custom_terms[name]
+            for sp, (gain, loss) in func(self).items():
+                if sp not in species_rates:          # prescribed species: skipped, as for a process
+                    continue
+                gain = np.asarray(gain, float)
+                loss = np.asarray(loss, float)
+                species_rates[sp] += gain - loss
+                species_gain[sp] += gain
+                species_loss[sp] += loss
+                species_gain_p[name][sp] += gain
+                species_loss_p[name][sp] += loss
+                if want_J and jacobian is None:
+                    i = np.arange(len(loss))
+                    species_J[sp][i, offsets[sp] + i] -= loss / self.distributions_1d[sp]
+            if want_J and jacobian is not None:
+                for sp, blocks in jacobian(self).items():
+                    if sp not in species_J:
+                        continue
+                    for sp2, block in blocks.items():
+                        if sp2 not in offsets:
+                            continue
+                        species_J[sp][:, offsets[sp2]:offsets[sp2] + len(self.r_grids[sp2])] += block
 
         # gain/loss exposed only via self (does NOT change the return signature)
         self.gain_rates = species_gain
@@ -1352,6 +1732,17 @@ class BEST:
     # ------------------------------------------------------------------
     # Time stepping (Vegas)
     # ------------------------------------------------------------------
+    def compute_rates(self, active_processes=None, t=None):
+        """Rate pass at the current state without stepping. Returns {species: C};
+        gain_rates, loss_rates and the per-process ledgers are filled as in a
+        step. COLLECTIVE."""
+        if active_processes is None:
+            active_processes = list(self.process_configs) + list(self.custom_terms)
+        self._want_jacobian = False
+        rates, _, _ = self._compute_rates_vegas(
+            active_processes, t=self.current_time if t is None else t)
+        return rates
+
     def _seed_from_production(self, species):
         """Start an all-zero distribution from its production spectrum:
         f = f_seed * G(q)/max G, with G the net rate at f = 0 (pure gain, since
@@ -1360,7 +1751,7 @@ class BEST:
         changing it). COLLECTIVE: called by all ranks; rank 0 holds the result,
         which evolve_step broadcasts."""
         procs = [p for p, c in self.process_configs.items()
-                 if species in c['input'] + c['output']]
+                 if species in c['input'] + c['output']] + list(self.custom_terms)
         if self.world_rank == 0:
             print(f"\nSeeding {species} (initialized empty) from its production spectrum: "
                   f"rate pass via {', '.join(procs)} at t = {self.current_time:.3e}", flush=True)
@@ -1381,9 +1772,10 @@ class BEST:
     def evolve_step(self, dt, active_processes=None,
                     adapt_dt=True, method='heun'):
         if active_processes is None:
-            active_processes = list(self.process_configs.keys())
+            active_processes = list(self.process_configs) + list(self.custom_terms)
         # Species initialized empty are seeded once from their production spectrum
         # (collective: every rank runs the rate pass).
+        self.step_hook(self)
         for s in [s for s in self.species_list if s in self._empty_species]:
             self._seed_from_production(s)
             self._empty_species.discard(s)
@@ -1415,7 +1807,7 @@ class BEST:
         # broadcasts it, so ALL ranks raise together (raising on rank 0 alone
         # would hang the others at the next collective).
         A_dict, Gamma_dict = {}, {}
-        if method in ('exprb', 'exprb_full'):     # exprb_full: the diagonal for the dt controller
+        if method in ('exprb', 'exprb2', 'exprb_full'):     # exprb_full: the diagonal for the dt controller
             exprb_err = None
             if self.world_rank == 0:
                 for species in self.species_list:
@@ -1447,7 +1839,7 @@ class BEST:
             for species in self.species_list:
                 f = self.distributions_1d[species]
                 f_safe = np.maximum(f, 1e-30)
-                if method in ('exprb', 'exprb_full'):
+                if method in ('exprb', 'exprb2', 'exprb_full'):
                     # limit the REALIZED (phi1-damped) change, not the explicit
                     # one -> the stiff linear part no longer throttles dt
                     z = np.clip(-Gamma_dict[species] * dt, -700.0, 700.0)
@@ -1536,6 +1928,45 @@ class BEST:
                 mass=self.species_mass.get(species, 0.0),
                 stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
 
+        elif method == 'exprb2':
+            # Two-stage exponential Rosenbrock (ETD2RK): the exprb predictor, a
+            # second rate pass at the predicted state and the phi2 correction of
+            # exprb2_update. Second order; a stiff species lags its moving
+            # equilibrium by 1/Gamma as it should, not by one step as with exprb.
+            f_original = {sp: self.distributions_1d[sp].copy() for sp in self.species_list}
+            if self.world_rank == 0:
+                for species in self.species_list:
+                    self.distributions_1d[species] = exprb_update(
+                        self.distributions_1d[species],
+                        A_dict[species], Gamma_dict[species], dt_actual)
+                    self.interpolators[species] = ExtrapolatingInterp(
+                        self.r_grids[species], self.distributions_1d[species],
+                        mass=self.species_mass.get(species, 0.0),
+                        stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
+                print(f"    [exprb2] rate pass at the predicted state...")
+            self.distributions_1d = self.world_comm.bcast(self.distributions_1d, root=0)
+            self.interpolators = self.world_comm.bcast(self.interpolators, root=0)
+            self._compute_rates_vegas(active_processes, t=self.current_time + dt_actual)
+            if self.world_rank == 0:
+                for species in self.species_list:
+                    A2, Gamma2 = assemble_A_Gamma(
+                        self.distributions_1d[species], self.gain_rates[species],
+                        self.loss_rates[species], self.species_config.get(species, 'boson'))
+                    f_new = exprb2_update(f_original[species], A_dict[species], Gamma_dict[species],
+                                          A2, Gamma2, dt_actual)
+                    neg = f_new < 0.0
+                    if neg.any():
+                        q = self.r_grids[species]
+                        dn = np.trapezoid(q * q * np.where(neg, self.f_floor - f_new, 0.0), q)
+                        print(f"    exprb2: {neg.sum()} negative occupations of {species} set to the floor; "
+                              f"number moved {dn / np.trapezoid(q * q * f_original[species], q):.1e}", flush=True)
+                        f_new[neg] = self.f_floor
+                    self.distributions_1d[species] = f_new
+                    self.interpolators[species] = ExtrapolatingInterp(
+                        self.r_grids[species], self.distributions_1d[species],
+                        mass=self.species_mass.get(species, 0.0),
+                        stat=self.species_config.get(species, 'boson'), a=self.scale_factor(self.current_time + dt_actual))
+
         elif method == 'exprb_full':
             # Exponential Rosenbrock-Euler with the full Jacobian of the collision
             # operator over all species and processes: f_new = f + dt phi1(dt J) C,
@@ -1577,7 +2008,9 @@ class BEST:
                     F_new[neg] = self.f_floor
                 if self.verbose:
                     lam = np.linalg.eigvals(dt_actual * J)
-                    print(f"    exprb_full: max Re(dt J) = {lam.real.max():+.3e}", flush=True)
+                    print(f"    exprb_full: max Re(dt J) = {lam.real.max():+.3e}; "
+                          f"J entries zeroed/kept (|J| < {self.J_SIG} sigma) = "
+                          f"{self.error_stats.get('J_zeroed', 0)}/{self.error_stats.get('J_kept', 0)}", flush=True)
                 off = 0
                 for sp, sz in zip(sps, sizes):
                     self.distributions_1d[sp] = F_new[off:off + sz]
@@ -1611,26 +2044,36 @@ class BEST:
                     return gamma_bulk
 
 
-                order = sorted(active_processes, key=_stiffness, reverse=True)
+                # a CP-conjugate pair is one substep: its members are stepped
+                # together from one rate pass (common samples)
+                units, seen = [], set()
+                for p in active_processes:
+                    if p in seen:
+                        continue
+                    partner = self.process_configs[p]['cp_conjugate'] if p in self.process_configs else None
+                    unit = (p, partner) if partner in active_processes else (p,)
+                    seen.update(unit)
+                    units.append(unit)
+                order = sorted(units, key=lambda u: max(_stiffness(p) for p in u), reverse=True)
             else:
                 order = None
             order = self.world_comm.bcast(order, root=0)
             if self.world_rank == 0 and self.verbose:
                 print(f"    [GS] order: {order}")
-            for i, proc in enumerate(order):
+            for i, unit in enumerate(order):
                 if i > 0:
                     self.distributions_1d = self.world_comm.bcast(
                         self.distributions_1d, root=0)
                     self.interpolators = self.world_comm.bcast(
                         self.interpolators, root=0)
-                    self._compute_rates_vegas([proc], t=self.current_time)
+                    self._compute_rates_vegas(list(unit), t=self.current_time)
                 if self.world_rank == 0:
                     for species in self.species_list:
                         stat = self.species_config.get(species, 'boson')
                         A_p, G_p = assemble_A_Gamma(
                             self.distributions_1d[species],
-                            self.gain_rates_by_process[proc][species],
-                            self.loss_rates_by_process[proc][species], stat)
+                            sum(self.gain_rates_by_process[p][species] for p in unit),
+                            sum(self.loss_rates_by_process[p][species] for p in unit), stat)
                         self.distributions_1d[species] = exprb_update(
                             self.distributions_1d[species], A_p, G_p, dt_actual)
                     a_rebuild = self.scale_factor(
@@ -1644,7 +2087,7 @@ class BEST:
         else:
             raise ValueError(
                 f"unknown method '{method}' "
-                f"(expected 'euler', 'heun', 'exprb', 'exprb_seq' or 'exprb_full')")
+                f"(expected 'euler', 'heun', 'exprb', 'exprb2', 'exprb_seq' or 'exprb_full')")
 
         # Broadcast final state
         self.distributions_1d = self.world_comm.bcast(
@@ -1879,20 +2322,24 @@ class BEST:
         process_configs_ser = {}
         for name, config in self.process_configs.items():
             cc = config.copy()
-            cc['matrix_element_squared_name'] = getattr(config['matrix_element_squared'], '__name__', None)
-            del cc['matrix_element_squared']
+            for entry in ('matrix_element_squared', 'mesq_backward'):
+                func = cc.pop(entry)
+                cc[entry + '_name'] = None if func is None else getattr(func, '__name__', '')
             process_configs_ser[name] = cc
 
         state = {
             'species_dof': getattr(self, 'species_dof', {}),
             'species_config': self.species_config,
             'species_mass': self.species_mass,
+            'species_antiparticle': self.species_antiparticle,
             'q_min': self.q_min, 'q_max': self.q_max, 'n_grid': self.n_grid,
             'distributions_1d': self.distributions_1d,
             'r_grids': self.r_grids,
             'current_time': self.current_time,
             'step_count': self.step_count,
             'process_configs': process_configs_ser,
+            'custom_terms': {name: tuple(getattr(f, '__name__', None) for f in pair)
+                             for name, pair in self.custom_terms.items()},
             'history': history,
             'vegas_integrators': integ_all,
             'n_r_parallel': self.n_r_parallel,
@@ -1904,10 +2351,14 @@ class BEST:
             pickle.dump(state, fh)
         print(f"Checkpoint saved: {filename}")
 
-    def load_checkpoint(self, filename, matrix_elements_squared=None):
+    def load_checkpoint(self, filename, matrix_elements_squared=None, custom_terms=None):
         """Load checkpoint. COLLECTIVE: must be called by ALL ranks together.
         Pass matrix_elements_squared={'process or function name': func} to restore
-        the |M|^2 functions (needed for lambdas, closures and partials).
+        the |M|^2 functions (needed for lambdas, closures and partials), with
+        {'process name': (func, func_backward)} for a process with its own reverse
+        |M|^2, and custom_terms={'term name': func or (func, jacobian)} for the
+        custom terms; otherwise all are looked up by function name in the caller's
+        globals.
 
         Memory: the heavy payload (per-group vegas integrators; ~MB each,
         x groups x processes x 2 directions) is NOT broadcast. Rank 0 pops it
@@ -1958,10 +2409,13 @@ class BEST:
         self.species_mass = state['species_mass']
         self.species_list = list(self.species_config.keys())
         self.species_dof = state['species_dof']
+        self.species_antiparticle = state.get('species_antiparticle', {})
         self.q_min = state['q_min']
         self.q_max = state['q_max']
         self.n_grid = state['n_grid']
         self.distributions_1d = state['distributions_1d']
+        self._empty_species = {s for s in self.species_list
+                               if np.max(self.distributions_1d[s]) <= self.f_floor}
         self.r_grids = state['r_grids']
         self.current_time = state['current_time']
         self.step_count = state['step_count']
@@ -1976,15 +2430,41 @@ class BEST:
         for name, config in state['process_configs'].items():
             cc = config.copy()
             func_name = cc.pop('matrix_element_squared_name', None)
-            func = (me_lookup.get(name) or me_lookup.get(func_name)
-                    or (caller_globals.get(func_name) if func_name else None))
+            bwd_name = cc.pop('mesq_backward_name', None)
+            entry = me_lookup.get(name)
+            func, bwd = entry if isinstance(entry, tuple) else (entry, None)
+            func = func or me_lookup.get(func_name) or (caller_globals.get(func_name) if func_name else None)
             if func is None:
                 raise ValueError(f"cannot restore process '{name}': pass its |M|^2 function in "
                                  f"matrix_elements_squared={{'{name}': func}}")
             cc['matrix_element_squared'] = func
+            if bwd_name is not None:
+                bwd = bwd or me_lookup.get(bwd_name) or caller_globals.get(bwd_name)
+                if bwd is None:
+                    raise ValueError(f"cannot restore the reverse |M|^2 of process '{name}': pass both in "
+                                     f"matrix_elements_squared={{'{name}': (func, func_backward)}}")
+            elif bwd is not None:
+                raise ValueError(f"process '{name}' was saved without a reverse |M|^2; a checkpoint restores "
+                                 "what was there (re-register the process to change it)")
+            cc['mesq_backward'] = bwd
+            cc.setdefault('cp_conjugate', None)
             self.process_configs[name] = cc
             if self.world_rank == 0:
                 print(f"  Restored process: {name}")
+
+        ct_lookup = custom_terms or {}
+        self.custom_terms = {}
+        for name, (func_name, jac_name) in state.get('custom_terms', {}).items():
+            entry = ct_lookup.get(name)
+            if entry is None:
+                entry = (caller_globals.get(func_name), caller_globals.get(jac_name) if jac_name else None)
+            func, jac = entry if isinstance(entry, tuple) else (entry, None)
+            if func is None:
+                raise ValueError(f"cannot restore custom term '{name}': pass its function in "
+                                 f"custom_terms={{'{name}': func}} or {{'{name}': (func, jacobian)}}")
+            self.custom_terms[name] = (func, jac)
+            if self.world_rank == 0:
+                print(f"  Restored custom term: {name}")
 
         for species in self.species_list:
             self.interpolators[species] = ExtrapolatingInterp(
