@@ -37,6 +37,8 @@ dependencies. The route used for development is a conda environment with
 (it installs `gvar` with it):
 
 ```
+git clone https://github.com/best-hep/best.git
+cd best
 conda create -n best python=3.13 numpy mpi4py
 conda activate best
 pip install scipy vegas
