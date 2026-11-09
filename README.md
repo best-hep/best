@@ -69,6 +69,8 @@ examples/
                       # bath: decays, fermions, expansion, exprb_full
   Mdecay_cp.py        # CP asymmetry of N ↔ Φ l as a result of the run: decay pair,
                       # l and l̄ as species, exprb_full; D1 reference
+  inflaton_bec.py     # a condensate (inflaton, zero mode only) decaying into a
+                      # self-interacting boson that thermalizes and condenses in turn
 scripts/
   plot.py             # Plot evolution from checkpoint
   compare_rates.py    # Vegas vs analytical 2→2 benchmark
@@ -81,6 +83,8 @@ scripts/
   plot_spectra_stfo.py  # f(q) snapshots + BE overlay for the freeze-out run
                         # (fits T from its prescribed bath species)
   plot_yield_stfo.py    # Y = n/s vs x = m1/T, with H vs net-rate panel
+  check_zero_mode.py  # zero-mode terms: detailed balance, energy, normalization vs Vegas
+  plot_bec.py         # particles and zero modes, spectra with the critical line (inflaton_bec)
 requirements.txt
 CHANGELOG.md
 LICENSE
@@ -223,9 +227,10 @@ solver.set_radiation_dominated(a0=1.0, t0=solver.current_time)
   at two Vegas passes per step. **Use this when the small departure of a stiff
   species from its moving equilibrium matters** (a CP asymmetry in strong
   wash-out): `exprb` leaves the species one step behind its equilibrium instead
-  of the physical lag. Occupations driven below zero are set to the floor and
-  reported. Validated so far on a decay into a prescribed bath
-  (`scripts/check_asymmetry.py`); experimental elsewhere.
+  of the physical lag. Occupations driven below zero are set to the floor,
+  fermion occupations driven past 1 to just below it, and reported. Validated
+  so far on a decay into a prescribed bath (`scripts/check_asymmetry.py`);
+  experimental elsewhere.
 - `exprb_seq` (sequential / Gauss–Seidel exponential splitting): **use this
   when a stiff number-conserving process (elastic scattering) runs alongside
   slow number-changing chemistry** (e.g. the sub-threshold freeze-out example,
@@ -249,7 +254,8 @@ solver.set_radiation_dominated(a0=1.0, t0=solver.current_time)
   choice. An entry of the Jacobian that its own Monte Carlo error does not
   resolve is set to zero (`BEST.J_SIG`, the multiple of σ; 0 disables; the
   counts are printed under `verbose`). Occupations driven below zero (empty
-  tails) are set to the floor and the number moved is reported. A stiff
+  tails) are set to the floor, fermion occupations driven past 1 to just below
+  it, and the number moved is reported. A stiff
   process that only keeps species in equilibrium with a prescribed bath is
   better given as a custom term with its Jacobian (below) than as a Monte
   Carlo process.
@@ -291,6 +297,83 @@ solver.step_hook = medium
 solver.set_mass_func('phi', lambda t: np.sqrt(m0 * m0 + solver.m_th2))
 ```
 
+### Zero mode
+
+```python
+solver.initialize_species('phi', lambda q: 0.0 * q, stat='boson', mass=4.0, n0=0.25)   # a condensate: nothing on the grid
+solver.zero_mode['chi']        # the zero mode of a massive boson, comoving number (a³ n₀)
+```
+
+A massive boson carries, next to its grid, its zero mode — the states
+p < q_min as one number, `solver.zero_mode[species]` (comoving, a³ n₀). It
+starts with what the initial distribution holds below q_min, plus
+`initialize_species(..., n0=)` for a species that starts as a condensate;
+fermions and massless bosons have none. Vegas leaves p < q_min to this
+variable. A 2 → 2 process with a leg in the zero mode is integrated with that
+leg at rest, the two other legs fixed up to one energy — BEST's own integrand,
+|M|², symmetry factor, g and statistics included, without Vegas — and the zero
+mode enters as N₀ when consumed and as N₀ + V₀ when produced,
+V₀ = g q_min³/(6π²) its states, the spontaneous part. A 1 ↔ 2 process whose
+single leg is in its zero mode decays at rest onto a line of two grid spacings
+around p* (its number exact, its energy while a p* lies on the grid — beyond
+q_max the daughters go to the end node; a narrower line is not held by the
+interpolator), with the statistics of the daughters at p* and the same line
+for the decay and the inverse decay, so that on a Bose–Einstein state the
+zero mode settles at V₀ f_BE(0); the width of the line is the grid's, not
+the physics', harmless while scattering spreads the daughters faster than
+the decay feeds them. The line, which reaches six spacings from p*, has to stay
+clear of the top max(10, n_grid/10) nodes — they fit the extrapolation that Vegas reads above
+q_max, and a line among them bends it — so an expansion run takes q_max above
+a_end p* by that margin. The
+exponential steps (`exprb`, `exprb2`, `exprb_seq`, `exprb_full`) take the
+zero mode as a state variable next to the grid: its coupling to the nodes is
+in the linearization, the reactions of each zero-mode leg are counted once,
+on the grid, and given to the zero mode — their number is conserved by
+construction, while nothing imposes energy conservation, which is the check —
+and a zero mode that exchanges fast with the grid relaxes within the step
+like a stiff node; the explicit steps give the zero mode what its terms
+exchanged. With `exprb_full` the zero-mode terms enter the full Jacobian like
+the Vegas rates, with the nodes they couple; the diagonal steps hold a node's
+partners over the step, and at an onset that empties the lowest nodes into
+the zero mode within a step the gain those nodes fed to the rest of the grid
+outlives them — number and energy are created. A condensate decaying into a
+gas that condenses in turn does this (`examples/inflaton_bec.py`): use
+`exprb_full` there, or a step that resolves the onset.
+Number and energy of the zero mode count in `compute_moments`, the history
+(`'n0'`) and checkpoints. A prescribed species keeps its zero mode as it
+keeps its grid; a condensate decaying into a prescribed bath still depletes.
+The zero mode stands for p < q_min as one point: a process whose momenta are
+not large against q_min feels that (a cold gas with q_min at a third of its
+thermal momentum: percent level in its rates) — lower q_min then. Not
+integrated: a 2 → 2 process with both legs of a pair in zero modes (the N₀²
+part — a condensate annihilating into lighter particles; with equal mass
+sums on the two sides the channel has no phase space), a 1 ↔ 2 process with
+one of the pair in a zero mode, processes of five or more legs; the last two
+are said once.
+
+So a boson whose number exceeds what the Bose–Einstein distribution with
+μ = m holds at its energy condenses by itself — the lowest nodes used to run
+away — and a condensate evaporates when expansion takes it below the
+critical line; a species initialized with `n0` only is a condensate decaying
+into its daughters. The moment the zero mode becomes visible follows from the
+spontaneous term V₀ and moves with q_min; the condensed state does not. Outside the kinetic description: mean-field effects on the
+dispersion, and the coherence of a condensate — the equation keeps
+occupations, not phases, so a decay is enhanced by stimulated emission,
+(1 + f)², not by parametric resonance; for a coherently oscillating parent
+the resonance (the occupation of the first band grows at about q m/2 for a
+narrow resonance,
+q the resonance parameter of its coupling to the daughters) has to be slower
+than what empties the band — scattering, the parent's own decay, expansion —
+for the kinetic description to hold. With `adapt_dt` the zero mode counts like
+a node; the onset of condensation is a fast transient, kept resolved or
+stepped through at a fixed dt. `scripts/check_zero_mode.py` checks detailed
+balance with the zero mode at its own equilibrium, energy conservation and
+the normalization against the Vegas rate; `examples/inflaton_bec.py` runs a
+condensate (an inflaton with nothing on its grid) decaying into a quartically
+self-interacting boson that thermalizes and condenses in turn, and compares
+the end state with the equilibrium that the initial energy and number fix
+(`scripts/plot_bec.py` draws its checkpoint).
+
 ### Custom collision terms
 
 A collision term that is not an *n* → *m* process with a matrix element, such as
@@ -314,7 +397,8 @@ term takes part in every rate pass and every stepper like a process. Nothing
 about it is checked by the solver: kinematics, statistics, detailed balance and
 conservation are the author's. An optional `jacobian(solver)` returns
 `{species: {species2: matrix}}` for the full-Jacobian step; without it the step
-uses the diagonal −loss/f. Checkpoints restore the term by function name
+uses the exponential steps' diagonal, −loss/f + η gain/(1 + ηf) (η = +1, −1, 0
+for bosons, fermions, Maxwell–Boltzmann). Checkpoints restore the term by function name
 (`load_checkpoint(..., custom_terms={'split': splitting})`).
 `scripts/check_custom_term.py` checks the decay N → Φ l written as
 one-dimensional kernels against the Vegas process.
@@ -392,10 +476,14 @@ python scripts/plot.py checkpoint.pkl
 ```
 
 writes one figure per species: the f(q) snapshot fan plus the N/N₀, E/E₀
-conservation history. The freeze-out example has its own scripts,
+conservation history, with the zero mode of a massive boson as its own line.
+The freeze-out example has its own scripts,
 `plot_spectra_stfo.py` and `plot_yield_stfo.py` (run next to `checkpoint.pkl`,
-no arguments). The checkpoint is a plain pickle — `state['history']` holds
-per-step f and moments for custom analysis.
+no arguments); `plot_bec.py` draws the decay of a condensate
+(`inflaton_bec.py`, same convention): particles and zero modes against the
+number delivered, the spectra against the critical Bose–Einstein line. The
+checkpoint is a plain pickle — `state['history']` holds per-step f and
+moments for custom analysis.
 
 ## Changelog
 

@@ -28,7 +28,7 @@ from scipy.special import kv, zeta
 from scipy.integrate import solve_ivp
 from scipy.interpolate import CubicSpline
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from besthep import BEST, exprb2_update, assemble_A_Gamma
+from besthep import BEST, exprb2_update, assemble_A_Gamma, grid_weights
 
 TOL = 0.03
 CASES = {10.0: 12.0, 0.1: 20.0}                       # K: z_stop
@@ -58,7 +58,7 @@ def run_besthep(K, z_stop, dt_frac=0.03, dn_max=0.05):
 
     def number(sp, f):
         q = sol.r_grids[sp]
-        return sol.species_dof[sp] / (2 * np.pi**2) * np.trapezoid(q * q * f, q)
+        return sol.species_dof[sp] / (2 * np.pi**2) * (grid_weights(q) * q * q) @ f
 
     def coefficients():
         sol.species_list = ['N', 'l']

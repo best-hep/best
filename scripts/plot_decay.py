@@ -14,8 +14,10 @@ T(t) is fitted per snapshot from the stored Phi spectrum (log(1/f + 1) = E/T), s
 no run-script constants are duplicated here. Species names, masses, statistics
 and dof come from the checkpoint. Usage: python plot_decay.py [checkpoint.pkl]
 """
-import sys, pickle
+import os, sys, pickle
 import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from besthep import grid_weights
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -51,11 +53,11 @@ T = np.array([fit_T(i) for i in range(len(t))]); z = M / T
 print(f"z from Phi fits: {z[0]:.3g} .. {z[-1]:.3g}")
 
 def comoving_n(sp, f, ai):
-    return dof.get(sp, 1) * np.trapezoid(q[sp] ** 2 * f, q[sp]) / (2 * np.pi ** 2)
+    return dof.get(sp, 1) * (grid_weights(q[sp]) * q[sp] ** 2) @ f / (2 * np.pi ** 2)
 
 def comoving_e(sp, f, ai, i):                              # comoving energy a^4 rho
     E = np.sqrt(q[sp] ** 2 + (ai * mass_at(sp, i)) ** 2)
-    return dof.get(sp, 1) * np.trapezoid(q[sp] ** 2 * E * f, q[sp]) / (2 * np.pi ** 2)
+    return dof.get(sp, 1) * (grid_weights(q[sp]) * q[sp] ** 2) @ (E * f) / (2 * np.pi ** 2)
 
 nN = np.array([comoving_n(N_SP, F[N_SP][i], a[i]) for i in range(len(t))])
 nN_eq = np.array([comoving_n(N_SP, eq_f(N_SP, q[N_SP], a[i], T[i], i), a[i]) for i in range(len(t))])
@@ -103,7 +105,7 @@ def mass_term(i):
         am_prev = a[max(i - 1, 0)] * mass_at(sp, max(i - 1, 0))
         dam_dt = (am_next - am_prev) / (t[min(i + 1, len(t) - 1)] - t[max(i - 1, 0)]) if len(t) > 1 else 0.0
         E_com = np.sqrt(q[sp] ** 2 + am ** 2)
-        tot += dof.get(sp, 1) * np.trapezoid(q[sp] ** 2 * F[sp][i] * am * dam_dt / E_com, q[sp]) / (2 * np.pi ** 2)
+        tot += dof.get(sp, 1) * (grid_weights(q[sp]) * q[sp] ** 2) @ (F[sp][i] * am * dam_dt / E_com) / (2 * np.pi ** 2)
     return tot
 src = np.array([mass_term(i) for i in range(len(t))])
 E_pred = E_tot[0] + np.concatenate([[0.0], np.cumsum(0.5 * (src[1:] + src[:-1]) * np.diff(t))])

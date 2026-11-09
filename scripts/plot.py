@@ -252,6 +252,8 @@ def plot_evolution(state, history, output_file='evolution.png',
 
         ax2.plot(times_cut, n_hist / N0, '-', lw=2, label='N/N₀')
         ax2.plot(times_cut, e_hist / E0, '--', lw=2, label='E/E₀')
+        if 'n0' in history[sp]:                      # the zero mode, part of N
+            ax2.plot(times_cut, np.array(history[sp]['n0'][:max_snap + 1]) / N0, '-.', lw=1.5, label='zero mode / N₀')
         ax2.axhline(1.0, color='gray', ls=':', alpha=0.5)
         ax2.ticklabel_format(style='sci', axis='x', scilimits=(0, 0), useMathText=True)
         ax2.set_xlabel(r'$t$')

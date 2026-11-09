@@ -32,7 +32,7 @@ import numpy as np
 from scipy.special import kv, kve, zeta
 from scipy.integrate import solve_ivp
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from besthep import BEST
+from besthep import BEST, grid_weights
 
 # --------------------------- scenario --------------------------------------
 M, G_N, G_BATH = 1.0, 2, 2                 # N mass (code unit); dof of N, of Phi and of l (doublets)
@@ -86,10 +86,10 @@ solver.add_process('decA', ['N'], ['Phi', 'l'], mesq_A, neval=neval, nitn=2, mes
 solver.add_process('decB', ['N'], ['Phibar', 'lbar'], mesq_B, neval=neval, nitn=2, mesq_backward=mesq_B, cp_conjugate='decA')
 
 # relaxation of the leptons to the plasma: the targets f_eq (1 +- mu) share the
-# lepton number of the pair, so the term conserves it exactly (same trapezoid as
-# the numbers below) and restores the number of the pair and the shape of each
+# lepton number of the pair, so the term conserves it exactly (the solver's moment
+# weights, as the numbers below) and restores the number of the pair and the shape of each
 q_l   = solver.r_grids['l']
-w_l   = np.zeros_like(q_l); w_l[:-1] += np.diff(q_l) / 2; w_l[1:] += np.diff(q_l) / 2; w_l *= q_l * q_l   # trapezoid weights
+w_l   = grid_weights(q_l) * q_l * q_l
 f_eq  = solver.distributions_1d['l'].copy()
 g_eq  = f_eq * (1.0 - (0.0 if MB else f_eq))   # shape of the asymmetry in kinetic equilibrium: df/dmu of the thermal distribution
 D_eq  = 2.0 * w_l @ g_eq
@@ -117,7 +117,7 @@ n_gamma_com = 2.0 * zeta(3) / np.pi**2 * T0**3      # photon density times a^3
 
 def comoving_number(sp):
     q = solver.r_grids[sp]
-    return solver.species_dof[sp] / (2 * np.pi**2) * np.trapezoid(q * q * solver.distributions_1d[sp], q) / n_gamma_com
+    return solver.species_dof[sp] / (2 * np.pi**2) * (grid_weights(q) * q * q) @ solver.distributions_1d[sp] / n_gamma_com
 
 def non_thermal():
     """Fraction of the asymmetry that is not in the thermal shape, sum |delta f - m f_l| /

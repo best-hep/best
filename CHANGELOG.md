@@ -1,5 +1,50 @@
 # Changelog
 
+### v1.3.2
+- Zero mode: a massive boson carries the states p < q_min as one number next
+  to its grid, `solver.zero_mode[species]` (comoving), from the initial
+  distribution below q_min and `initialize_species(..., n0=)`. Vegas leaves
+  p < q_min to it; a 2 → 2 process with a leg in the zero mode is integrated with that
+  leg at rest (no Vegas, N₀ consumed, N₀ + V₀ produced), a 1 ↔ 2 process with
+  its single leg in the zero mode decays at rest onto a line of two grid spacings
+  around p* (number exact, energy while a p* lies on the grid; q_max well above
+  a_end p* in an expansion run); a 2 → 2 process
+  with both legs of a pair in zero modes (N₀²) is not integrated. The
+  exponential steps take the zero mode as
+  a state variable coupled to the grid (its reactions counted once, number
+  conserved by construction, a fast exchange relaxed within the step; with
+  `exprb_full` the zero-mode terms are in
+  the full Jacobian with the nodes they couple), the explicit steps give it
+  what its terms exchanged. Bose condensation of
+  a supercritical boson, its evaporation under expansion and the decay of a
+  condensate come out of the run. Moments, history (`'n0'`), checkpoints and
+  `scripts/plot.py` include the zero mode. Runs of massive bosons change by the
+  legs below q_min (per-cent level where q_min is not small against the momenta).
+  `examples/inflaton_bec.py`, `scripts/check_zero_mode.py`, `scripts/plot_bec.py`.
+- Fixed: the backward fallback of a grid point is chosen by the error of the
+  net rate, not of the backward rate alone (at a Bose-enhanced node the two
+  directions nearly cancel on common samples; an independent estimate broke
+  the cancellation and gave the node a spurious net rate). The iteration
+  weights of a rate are relative (no overflow when an integrand underflows).
+  A checkpoint is written to a temporary file and moved into place (a killed
+  job leaves no truncated checkpoint), and a load error reaches every rank.
+  The quality-control counters of a rate pass are summed over the ranks. An
+  |M|² that is nan off shell is masked. A re-initialization clears the empty
+  mark of an earlier one. A custom term without a Jacobian enters the
+  full-Jacobian step with the exponential steps' diagonal,
+  −loss/f + η gain/(1 + ηf) (η = +1, −1, 0 for bosons, fermions,
+  Maxwell–Boltzmann), not −loss/f.
+- Moments by Simpson's rule in ln q on a log grid (`grid_weights`; the trapezoid
+  rule otherwise): `compute_moments`, the initialization printout, the zero mode's
+  weights, `examples/Mdecay_cp.py`, `scripts/plot_decay.py`,
+  `scripts/check_asymmetry.py`. The trapezoid rule in q overestimated n and e by
+  a few 0.1 % on the grids of the examples; history values move by that much.
+- Fermion occupations driven past 1 by a step that is not bound by construction
+  (heun, the exprb2 correction, exprb_full) are set to `F_FERMION_MAX` = 1 − 1e-8
+  and reported, as negative ones are set to the floor; the interpolator takes
+  such values. The constant keeps the consistency check of the exponential
+  steps within its tolerance.
+
 ### v1.3.1
 - CP violation: the reverse direction of a process no longer has to carry the
   forward |M|^2. `add_process(..., mesq_backward=func)` gives

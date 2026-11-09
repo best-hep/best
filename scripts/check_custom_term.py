@@ -218,7 +218,8 @@ diff = max(np.max(np.abs(sf.distributions_1d[s] - se.distributions_1d[s]) / np.m
 check("checkpoint restores the custom term; a step after the restore equals the original's next step",
       'dec_k' in sf.custom_terms and diff <= NQ * np.finfo(float).eps,
       f"max rel diff {diff:.1e} (deterministic kernel: the rounding of its {NQ}-point sums; a species restored non-empty must not be re-seeded)")
-os.remove(fn)
+if se.world_rank == 0:                                              # one rank removes the file; under mpirun every rank runs this script
+    os.remove(fn)
 
 print(f"\n{sum(rows)}/{len(rows)} checks passed")
 sys.exit(0 if all(rows) else 1)
