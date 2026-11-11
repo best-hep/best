@@ -24,7 +24,10 @@ chi grid and zero mode as fractions of 2 n_phi0, the totals of number and energy
 the step), the temperature and chemical potential fitted to the chi grid, the occupation
 at the deposit line and the lowest node over its critical value. At the end, the chi zero
 mode and the thermal phi against the prediction, the time the grid turned supercritical
-against the expectation at the bare decay rate (earlier, by the enhancement). checkpoint.pkl (state and history) is written every step and a run resumes
+against the expectation at the bare decay rate (earlier, by the enhancement). Early on, before
+the scattering has spread the daughters, the occupation at p* is that of the deposit line, whose
+width is the grid's: that part of the enhancement, and this time with it, move with N_GRID; the
+end state does not. checkpoint.pkl (state and history) is written every step and a run resumes
 from it; delete it to start fresh.
 
 The step is the full-Jacobian exponential one (see the loop); it needs dt times the elastic
@@ -43,7 +46,7 @@ M_CHI     = 1.0                                                   # the unit of 
 M_PHI     = 4.0 * M_CHI                                           # each chi is born with the kinetic energy m_chi: p* = sqrt(3) m_chi
 N_PHI0    = 0.25
 LAMBDA    = 3.0
-N_GRID    = 60
+N_GRID    = 80
 NEVAL     = 10000
 GAMMA_PHI = 1e-4 * M_CHI                                          # the width, a narrow resonance; 1/Gamma_phi is the run's time unit
 P_STAR    = np.sqrt(M_PHI**2 / 4.0 - M_CHI**2)                    # the momentum of the daughters
@@ -61,7 +64,7 @@ solver = BEST(q_min=Q_MIN, q_max=Q_MAX, n_grid=N_GRID)
 
 def mesq_dec(mom):
     """|M|^2 of phi -> chi chi from the width: the solver decays a particle of the zero mode at the rate
-    sym |M|^2 p*/(8 pi m_phi^2 g_phi) (_zero_mode_decay), sym = 1/2 for two identical daughters."""
+    sym |M|^2 p*/(8 pi m_phi^2 g_phi) (_zero_mode_line), sym = 1/2 for two identical daughters."""
     sym, g_phi = solver.process_configs['dec']['symmetry_factor'], solver.species_dof['phi']
     return np.full(mom.shape[2], 8.0 * np.pi * M_PHI**2 * g_phi * GAMMA_PHI / (sym * P_STAR))
 

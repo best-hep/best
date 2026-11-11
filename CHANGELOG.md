@@ -1,5 +1,34 @@
 # Changelog
 
+### v1.3.3
+- Zero modes: any number of legs of any process at rest. Every choice of legs
+  in their zero modes is one part of the process, integrated with those legs
+  at rest: with two legs in motion a line at the momentum the kinematics fixes
+  (two or three zero-mode particles annihilating into a pair, a decay with one
+  daughter into its zero mode, next to the decay of a zero mode at rest), with
+  three one integration (three-body decays and annihilations of zero modes,
+  next to a 2 → 2 process with one leg at rest), with four or more the Monte
+  Carlo over the legs in motion with the others frozen at rest, each part a
+  rate pass of its own (a 2 ↔ 3 process with one leg at rest: φφ ↔ φφφ takes
+  six passes instead of two; `solver.zero_mode_sampled = False` leaves these
+  parts out). Nothing is left out but the exchange between zero modes of equal
+  mass in forward scattering.
+  A term carries its derivatives with respect to its zero modes (one
+  evaluation instead of two; products of zero modes enter the Jacobian of the
+  exponential steps exactly), identical legs are taken once, and a reaction
+  that changes no grid (χχ ↔ χχφ with φ at rest) is counted on its incoming
+  legs.
+  `scripts/check_zero_mode.py` checks the new terms against closed forms, the
+  Vegas rate and each other.
+- Fixed: a four-leg process other than 2 → 2 (1 → 3, 3 → 1) with a leg at
+  rest on the observed leg's side was integrated over the range of the 2 → 2
+  topology (over nothing, for a decay with one daughter at rest: the parent's
+  grid lost what the daughters' grid never received). A decay at rest of a zero
+  mode lighter than the mass difference of its daughters was taken as open.
+- Output: the header of a rate pass shows the reaction, the observed leg in
+  brackets and a leg at rest in its zero mode as species(0)
+  (`2to3: [phi] phi -> phi(0) phi phi`).
+
 ### v1.3.2
 - Zero mode: a massive boson carries the states p < q_min as one number next
   to its grid, `solver.zero_mode[species]` (comoving), from the initial

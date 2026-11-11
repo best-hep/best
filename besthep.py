@@ -23,10 +23,10 @@ Usage:
     # Zero mode: a massive boson carries, next to its grid, the number of its zero mode
     # p < q_min as one variable, solver.zero_mode[species] (comoving, a^3 n_0): the
     # content of the initial distribution below q_min, plus initialize_species(...,
-    # n0=) for a species that starts as a condensate. A 2 -> 2 process with a leg in
-    # the zero mode is integrated with that leg at rest (no Vegas); its exchange with the
-    # grid moves the zero mode, so a supercritical boson condenses and a condensate
-    # evaporates by itself. Moments, history ('n0') and checkpoints include it.
+    # n0=) for a species that starts as a condensate. The parts of a process with legs in
+    # zero modes are integrated with those legs at rest; their exchange with the grid moves
+    # the zero modes, so a supercritical boson condenses and a condensate evaporates, decays
+    # or annihilates by itself. Moments, history ('n0') and checkpoints include it.
 
     # CP violation: the reverse direction output -> input has the forward |M|^2
     # (T invariance) unless its |M|^2 is given or the process has a CP conjugate
@@ -81,6 +81,8 @@ _MPI_WORLD = MPI.COMM_WORLD      # taken before any BEST() repoints MPI.COMM_WOR
 from scipy.integrate import quad
 from scipy.optimize import brentq
 from scipy.interpolate import PchipInterpolator
+import itertools
+from math import comb
 import time
 import os
 import pickle
@@ -386,6 +388,8 @@ class BEST:
                             # and the weighted average of the joint columns divides by it
     verbose = False         # dev/debug output
     bw_fallback_rel_err = 0.3
+    zero_mode_sampled = True  # the parts of a process with legs in zero modes and four or more legs in motion
+                              # are Monte Carlo passes of their own (_zero_mode_sampled); False leaves them out
     J_SIG = 1.0             # exprb_full: an entry of the Monte Carlo Jacobian is used only if
                             # |J_ij| >= J_SIG * sigma_ij (sigma from the sum of squares of the
                             # sample contributions, accumulated with the row). Same rule as the
@@ -472,7 +476,8 @@ class BEST:
         self._empty_species = set()      # species initialized at the floor: seeded at the first step
         self.zero_mode = {}              # {massive boson: comoving number of its zero mode, p < q_min}
         self._zero_mode_terms = []            # the zero-mode terms of the last rate pass (see _zero_mode_rates)
-        self._zero_mode_skipped = set()
+        self._legs_at_rest = ()               # a zero-mode term integrated by the Monte Carlo (_zero_mode_sampled): its legs frozen at rest,
+        self._rest_scale = (1.0, 1.0)         # and their weights in the forward and in the reverse direction
         self.vegas_integrators = {}
         self._integrator_suffix = ''
         self._analytical_integrators = {}
@@ -790,7 +795,7 @@ class BEST:
         key = f"{section}_{mode}" if section is not None else mode
         if key not in self.vegas_integrators[proc_key]:
             config = self.process_configs[process_name]
-            n_integrate = config['n_in'] + config['n_out'] - 2
+            n_integrate = config['n_in'] + config['n_out'] - 2 - len(self._legs_at_rest)   # legs at rest are not integrated
             # Rotational symmetry about the target axis: the azimuth of the
             # first integrated leg is fixed at 0 (its 2*pi is folded into the
             # Jacobian), so the domain has 3*n_integrate - 1 dimensions.
@@ -798,11 +803,11 @@ class BEST:
             # fixes the angle of the single sampled leg, leaving one dimension,
             # the log of its energy (see collision_integrand_batch).
             domain = []
-            if n_integrate == 1:
+            if config['n_total'] == 3:
                 domain = [[0.0, 1.0]]
             else:
-                # n_total - 3 legs sampled freely (first azimuth fixed), the last
-                # pair by two-body kinematics: two angular fractions in [0, 1]
+                # all legs in motion but three sampled freely (first azimuth fixed), the
+                # last pair by two-body kinematics: two angular fractions in [0, 1]
                 for k_leg in range(n_integrate - 1):
                     domain.extend([
                         [self.q_min, self.q_max * self.domain_extension], [0, np.pi]
@@ -888,7 +893,10 @@ class BEST:
         n_in = config['n_in']
         n_out = config['n_out']
         n_total = n_in + n_out
-
+        # legs frozen at rest (a zero-mode term, _zero_mode_sampled): E = m, p = 0, no integration
+        # and no statistics -- their weights multiply the two directions outside
+        frozen = self._legs_at_rest
+        moving = [k for k in range(n_total) if k not in frozen]
 
         target_idx, sign = self._target_slot(config, target_species)
 
@@ -958,7 +966,10 @@ class BEST:
                     if id(c) not in weighted:
                         weighted[id(c)] = _flush(c * wgt)
                     return weighted[id(c)]
-                _jacobian(acc[:, :n_cols], f_arr, q_com_legs, wgt_of(cf), wgt_of(cb), all_species, target_species)
+                wf, wb = wgt_of(cf), wgt_of(cb)
+                if frozen:                         # the legs at rest weight the two directions differently
+                    wf, wb = wf * self._rest_scale[0], wb * self._rest_scale[1]
+                _jacobian(acc[:, :n_cols], f_arr, q_com_legs, wf, wb, all_species, target_species)
                 if partner is not None:
                     _jacobian(acc[:, n_cols:], f_arr_p, q_com_legs, wgt_of(cfp), wgt_of(cbp), all_species_p, all_species_p[target_idx])
                 return acc
@@ -1023,9 +1034,9 @@ class BEST:
             the target: its own node, weight 1). legs: the species of the legs."""
             if target_sp not in J_offset:
                 return
-            for k in range(n_total):
+            for k in moving:
                 FWk = np.ones(common_f.size); BWk = np.ones(common_f.size)
-                for j in range(n_total):
+                for j in moving:
                     if j == k:
                         continue
                     block = 1.0 + eta[j] * f_arr[j]
@@ -1050,7 +1061,7 @@ class BEST:
             # BW: the reverse. eta = +1 boson, -1 fermion, 0 Maxwell-Boltzmann.
             # (N explicit: an interpolator returns a float for a single sample.)
             FW = np.ones(N); BW = np.ones(N)
-            for k in range(n_total):
+            for k in moving:
                 block = 1.0 + eta[k] * f_arr[k]
                 if k < n_in:
                     FW *= f_arr[k]; BW *= block
@@ -1142,13 +1153,13 @@ class BEST:
         # parameter, and the pair measure p*/(4 pi M_R) per unit solid-angle
         # fraction is smooth everywhere (no 1/|R| from a lab-frame energy
         # variable).
-        free_out = [i for i in range(n_in, n_total) if i != target_idx]
-        free_in = [i for i in range(n_in) if i != target_idx]
+        free_out = [i for i in moving if i >= n_in and i != target_idx]
+        free_in = [i for i in moving if i < n_in and i != target_idx]
         opposite, same = (free_out, free_in) if target_idx < n_in else (free_in, free_out)
         pair = opposite if len(opposite) >= 2 else same     # fewest legs subtracted from R
         s_idx, c_idx = pair[0], pair[1]
         pair_side = 'out' if s_idx >= n_in else 'in'
-        sampled = [i for i in range(n_total) if i not in (target_idx, s_idx, c_idx)]
+        sampled = [i for i in moving if i not in (target_idx, s_idx, c_idx)]
         m_s, m_c = masses[s_idx], masses[c_idx]
         p_t = q1_mag / a
         E_t = np.sqrt(p_t**2 + masses[target_idx]**2)
@@ -1165,7 +1176,9 @@ class BEST:
             energies = np.zeros((n_total, N))
             mom_z[target_idx] = p_t
             energies[target_idx] = E_t
-            measure = np.full(N, 2.0 * np.pi)          # the azimuth fixed by rotational symmetry
+            for k in frozen:
+                energies[k] = masses[k]
+            measure = np.full(N, 2.0 * np.pi if sampled else 1.0)   # the azimuth of the first sampled leg, fixed by rotational symmetry
             col = 0
             for k_pos, k in enumerate(sampled):
                 q_mag = x[:, col]; th = x[:, col + 1]; col += 2
@@ -1254,7 +1267,7 @@ class BEST:
                 return _pack(FW, BW, common, common_b, f_arr, q_legs, wgt)
             f_arr_p = [None] * n_total
             f_arr_p[target_idx] = np.clip(interps_p[all_species_p[target_idx]](np.full(N, q1_mag)), 0, None)
-            for k in range(n_total):
+            for k in moving:
                 if k != target_idx:
                     f_arr_p[k] = np.clip(interps_p[all_species_p[k]](q_legs[k]), 0, None)
             FWp, BWp = _statistics(f_arr_p, N)
@@ -1460,9 +1473,16 @@ class BEST:
             if self.world_rank == 0:
                 stat = self.species_config[species]
                 mass = self.species_mass.get(species, 0.0)
+                reactions = []       # each process as its reaction: the observed leg in brackets, a leg at rest in its zero mode as species(0)
+                for p in active_processes:
+                    cfg = self.process_configs[p]
+                    slot = self._target_slot(cfg, species)[0]
+                    legs = [f"[{l}]" if i == slot else f"{l}(0)" if i in self._legs_at_rest else l
+                            for i, l in enumerate(cfg['input'] + cfg['output'])]
+                    reactions.append(f"{p}: {' '.join(legs[:cfg['n_in']])} -> {' '.join(legs[cfg['n_in']:])}")
                 print(f"\n  Computing C[f] for {species} "
                       f"({stat}, m={mass}, a={self.scale_factor(t):.4f}) "
-                      f"via {', '.join(active_processes)}:")
+                      f"via {', '.join(reactions)}")
                 print(f"    Grid points: {len(self.r_grids[species])}", flush=True)
 
             # species whose rates this pass produces: the observed one and, for a
@@ -1703,52 +1723,60 @@ class BEST:
                             continue
                         species_J[sp][:, offsets[sp2]:offsets[sp2] + len(self.r_grids[sp2])] += block
 
-        # zero modes: the part of a 2 -> 2 process with one leg in a zero mode, and a 1 <-> 2
-        # process whose single leg is in its zero mode (decay at rest). Each term is affine in the
-        # number of its zero mode; it is evaluated at N0 and at N0 + V0 (_zero_mode_terms, _zero_mode_terms_bump),
-        # which gives the exponential steps the zero mode's column of the Jacobian (_zero_mode_system).
-        self._zero_mode_terms, self._zero_mode_terms_bump = [], []
+        # zero modes: the parts of a process with legs at rest in their zero modes. For a target in
+        # motion every choice of the other legs at rest is one term: with two legs in motion a line
+        # (_zero_mode_line), with three one integration (_zero_mode_rates), with more the Monte Carlo
+        # over the legs in motion (_zero_mode_sampled). Identical legs give equal terms, taken once
+        # with their number. A term carries its derivatives with respect to the zero modes of its
+        # legs at rest, which give the exponential steps the zero modes' columns of the Jacobian
+        # (_zero_mode_system).
+        self._zero_mode_terms = []
         for name in [p for p in active_processes if p in self.process_configs]:
             cfg = self.process_configs[name]
-            if not any(l in self.zero_mode for l in cfg['input'] + cfg['output']):
-                continue
-            if cfg['n_total'] == 3:
-                one = 'input' if cfg['n_in'] == 1 else 'output'
-                pair = cfg['output' if one == 'input' else 'input']
-                if any(l in self.zero_mode for l in pair) and self.world_rank == 0 and name not in self._zero_mode_skipped:
-                    self._zero_mode_skipped.add(name)
-                    print(f"zero mode: {name}: its part with one of the pair in its zero mode is not integrated")
-                if cfg[one][0] not in self.zero_mode:
+            legs, n_in, n_total = cfg['input'] + cfg['output'], cfg['n_in'], cfg['n_total']
+            can_rest = [l in self.zero_mode and self.species_mass.get(l, 0.0) > 0.0 for l in legs]
+            own_reverse = sorted(cfg['input']) == sorted(cfg['output'])
+            for sp, side in itertools.product(dict.fromkeys(legs), ('input',) if own_reverse else ('input', 'output')):
+                if sp not in cfg[side]:
                     continue
-                evaluate = lambda: [self._zero_mode_decay(name, sp, t) for sp in dict.fromkeys(pair)]
-            elif cfg['n_total'] == 4:
-                sides = ('input',) if sorted(cfg['input']) == sorted(cfg['output']) else ('input', 'output')
-                evaluate = lambda: [term for sp in dict.fromkeys(cfg['input'] + cfg['output']) for side in sides
-                                    if cfg[side].count(sp) for term in self._zero_mode_rates(name, sp, side, t)]
-            else:
-                if self.world_rank == 0 and name not in self._zero_mode_skipped:
-                    self._zero_mode_skipped.add(name)
-                    print(f"zero mode: {name} has {cfg['n_total']} legs; its part with a leg in its zero mode is not integrated")
-                continue
-            terms = evaluate()
-            saved = dict(self.zero_mode)
-            for sp_c in self.zero_mode:
-                self.zero_mode[sp_c] += self.species_dof.get(sp_c, 1) * self.q_min**3 / (6.0 * np.pi**2)
-            bumped = evaluate()
-            self.zero_mode = saved
-            for term, term_b in zip(terms, bumped):
-                sp, gain, loss, J_t = term[0], term[5], term[6], term[7]
-                self._zero_mode_terms.append((name,) + term)
-                self._zero_mode_terms_bump.append((name,) + term_b)
-                if sp not in species_rates:          # prescribed species: the zero mode still counts the reactions
-                    continue
-                species_rates[sp] += gain - loss
-                species_gain[sp] += gain
-                species_loss[sp] += loss
-                species_gain_p[name][sp] += gain
-                species_loss_p[name][sp] += loss
-                if want_J:
-                    species_J[sp] += J_t
+                tgt = cfg[side].index(sp) + (0 if side == 'input' else n_in)
+                groups = {}                      # the other legs that can be at rest, identical ones together
+                for i in range(n_total):
+                    if i != tgt and can_rest[i]:
+                        groups.setdefault((legs[i], i < n_in), []).append(i)
+                for counts in itertools.product(*(range(len(g) + 1) for g in groups.values())):
+                    rest = [i for g, c in zip(groups.values(), counts) for i in g[:c]]
+                    in_motion = n_total - len(rest)
+                    if not rest or in_motion == 1:   # the target alone in motion would be at rest too
+                        continue
+                    if in_motion > 3 and not self.zero_mode_sampled:
+                        continue
+                    comp = tuple(sorted((c, sum(legs[i] == c and i < n_in for i in rest),
+                                         sum(legs[i] == c and i >= n_in for i in rest)) for c in {legs[i] for i in rest}))
+                    if own_reverse:                  # the two directions are one reaction: a class and its mirror together
+                        comp = min(comp, tuple((c, k_out, k_in) for c, k_in, k_out in comp))
+                    if sp not in species_rates:      # prescribed species: observed only where its grid counts the reactions for the zero modes
+                        counts_on, counts_side, _ = self._zero_mode_stoichiometry(name, comp)
+                        if sp != counts_on or counts_side not in (None, side):
+                            continue
+                    term = (self._zero_mode_line if in_motion == 2 else self._zero_mode_rates if in_motion == 3
+                            else self._zero_mode_sampled)(name, tgt, rest, t)
+                    if term is None:                 # closed
+                        continue
+                    times = float(np.prod([comb(len(g), c) for g, c in zip(groups.values(), counts)]))
+                    gain, loss = times * term[0], times * term[1]
+                    dnet = {c: times * d for c, d in term[2].items()}
+                    J_t = None if term[3] is None else times * term[3]
+                    self._zero_mode_terms.append((name, sp, comp, gain, loss, dnet, J_t, side))
+                    if sp not in species_rates:
+                        continue
+                    species_rates[sp] += gain - loss
+                    species_gain[sp] += gain
+                    species_loss[sp] += loss
+                    species_gain_p[name][sp] += gain
+                    species_loss_p[name][sp] += loss
+                    if want_J:
+                        species_J[sp] += J_t
 
         # gain/loss exposed only via self (does NOT change the return signature)
         self.gain_rates = species_gain
@@ -1768,23 +1796,40 @@ class BEST:
 
     _gl = np.polynomial.legendre.leggauss(80)   # quadrature of the zero-mode terms, placed in ln K
 
-    def _zero_mode_rates(self, name, target, side, t):
-        """The terms of a 2 -> 2 process with one leg in a zero mode, for the target
-        species on one side: BEST's integrand with that leg at rest (E = m, p = 0), the
-        two remaining legs fixed by the four delta functions up to one energy,
-        d^3p_r d^3p_s (2 pi)^4 delta^4 / ((2 pi)^6 4 E_r E_s) = dE_r / (8 pi p_t), and the
-        zero-mode leg's phase-space integral replaced by N0/(g a^3 2m) when it is consumed and
-        (N0 + V0)/(g a^3 2m) when it is produced (V0 = g q_min^3/(6 pi^2): the states of the
-        zero mode, the spontaneous part). Returns one entry per zero-mode leg,
-        (target, side, n_s, its species, the leg on the input side, gain, loss, J), with
-        gain and loss of the target already carrying the multiplicity n_s; J, when the
-        step wants the Jacobian (exprb_full), is d(gain - loss)/df over the nodes of all
-        species (the target's own node, the other two legs through _node_weights as in
-        collision_integrand_batch), else None."""
+    def _rest_weights(self, legs, n_in, rest, a):
+        """The legs at rest of a zero-mode term: each stands for its phase-space integral over
+        its zero mode, N0/(g a^3 2m) where the reaction consumes it and (N0 + V0)/(g a^3 2m)
+        where it produces it (V0 = g q_min^3/(6 pi^2): the states of the zero mode, the
+        spontaneous part). Returns the product over the legs for the forward and for the
+        reverse direction and the derivatives of the two with respect to the zero modes,
+        {species: d/dN0}."""
+        fw, bw, dfw, dbw = 1.0, 1.0, {}, {}
+        for i in rest:
+            c = legs[i]
+            g = self.species_dof.get(c, 1)
+            N0, V0, unit = self.zero_mode[c], g * self.q_min**3 / (6.0 * np.pi**2), g * a**3 * 2.0 * self.species_mass[c]
+            x_f, x_b = (N0, N0 + V0) if i < n_in else (N0 + V0, N0)     # forward: consumed if on the input side
+            dfw = {s: d * x_f / unit for s, d in dfw.items()}
+            dbw = {s: d * x_b / unit for s, d in dbw.items()}
+            dfw[c], dbw[c] = dfw.get(c, 0.0) + fw / unit, dbw.get(c, 0.0) + bw / unit
+            fw, bw = fw * x_f / unit, bw * x_b / unit
+        return fw, bw, dfw, dbw
+
+    def _zero_mode_rates(self, name, tgt, rest, t):
+        """A zero-mode term with three legs in motion -- the target (slot tgt) and two others --
+        and the legs `rest` at rest in their zero modes: BEST's integrand with the legs at rest
+        at E = m, p = 0 and weighted as in _rest_weights, the two other legs in motion fixed by
+        the four delta functions up to one energy,
+        d^3p_r d^3p_s (2 pi)^4 delta^4 / ((2 pi)^6 4 E_r E_s) = dE_r / (8 pi p_t).
+        Returns (gain, loss, dnet, J) on the target's grid: gain and loss carry the multiplicity
+        of the target on its side, dnet = {species: d(gain - loss)/dN0} for the zero modes of
+        the legs at rest, and J, when the step wants the Jacobian (exprb_full), is
+        d(gain - loss)/df over the nodes of all species (the target's own node, the two other
+        legs through _node_weights as in collision_integrand_batch), else None."""
         cfg = self.process_configs[name]
         legs = cfg['input'] + cfg['output']
         n_in = cfg['n_in']
-        tgt = cfg[side].index(target) + (0 if side == 'input' else n_in)
+        target, side = legs[tgt], 'input' if tgt < n_in else 'output'
         n_s = cfg[side].count(target)
         sgn = np.array([1.0] * n_in + [-1.0] * cfg['n_out'])
         eta = np.array([{'boson': 1.0, 'fermion': -1.0}.get(self.species_config[l], 0.0) for l in legs])
@@ -1794,7 +1839,6 @@ class BEST:
         p_t = q / a
         E_t = np.sqrt(p_t**2 + mass[tgt]**2)
         kin = lambda p, m: p**2 / (np.sqrt(p**2 + m**2) + m)
-        K_t = kin(p_t, mass[tgt])
         K_min = [kin(self.q_min / a, m) for m in mass]
         K_max = [kin(self.q_max * self.domain_extension / a, m) for m in mass]   # the range Vegas samples
         pref = n_s * cfg['symmetry_factor'] / self.species_dof.get(target, 1) / (2.0 * E_t) / (8.0 * np.pi * p_t)
@@ -1811,127 +1855,140 @@ class BEST:
             u = 0.5 * (np.log(hi) - np.log(lo)) * (x + 1.0) + np.log(lo)
             return np.exp(u), 0.5 * (np.log(hi) - np.log(lo)) * w_gl * np.exp(u)
 
-        out = []
-        for k in [i for i, l in enumerate(legs) if l in self.zero_mode and i != tgt and mass[i] > 0.0]:
-            g_c, m_c = self.species_dof.get(legs[k], 1), mass[k]
-            N0 = self.zero_mode[legs[k]]
-            V0 = g_c * self.q_min**3 / (6.0 * np.pi**2)
-            zero_mode_in = k < n_in
-            fw_c = (N0 if zero_mode_in else N0 + V0) / (g_c * a**3 * 2.0 * m_c)   # forward: the zero-mode leg is consumed if on the input side
-            bw_c = (N0 + V0 if zero_mode_in else N0) / (g_c * a**3 * 2.0 * m_c)   # reverse: the other way round
-            r, s = [i for i in range(4) if i not in (tgt, k)]
-            same = sgn[k] == sgn[tgt]     # t + c <-> r + s: K_r + K_s = S, else t + r <-> c + s and the like: K_r free
-            FW_t, BW_t = np.zeros_like(q), np.zeros_like(q)
-            J = np.zeros((len(q), self._n_jacobian_cols())) if want_J else None
-            for j in range(len(q)):
-                S = E_t[j] + m_c - mass[r] - mass[s]
-
-                def kin(K_r):
-                    E_r = K_r + mass[r]
-                    p_r = np.sqrt(K_r * (K_r + 2.0 * mass[r]))
-                    E_s = -(sgn[tgt] * E_t[j] + sgn[k] * m_c + sgn[r] * E_r) / sgn[s]
-                    p_s2 = E_s**2 - mass[s]**2
-                    cos = (p_s2 - p_t[j]**2 - p_r**2) / (2.0 * sgn[tgt] * sgn[r] * p_t[j] * p_r)
-                    return E_r, p_r, E_s, p_s2, cos, (E_s - mass[s] >= K_min[s]) & (np.abs(cos) <= 1.0)
-
-                def place(lo, hi):        # nodes over [lo, hi]; same side: two sets, each in the log of its leg's K
-                    if not same:
-                        return nodes(lo, hi)
-                    K1, w1 = nodes(lo, min(0.5 * S, hi))
-                    K2, w2 = nodes(S - hi, min(0.5 * S, S - lo))
-                    return np.concatenate([K1, S - K2]), np.concatenate([w1, w2])
-
-                def edge(K_out, K_in):    # the kinematic edge between a point outside and one inside, by bisection
-                    for _ in range(40):
-                        K_mid = 0.5 * (K_out + K_in)
-                        K_out, K_in = (K_out, K_mid) if kin(np.array([K_mid]))[-1][0] else (K_mid, K_in)
-                    return K_in
-
-                lo, hi = (K_min[r], S - K_min[s]) if same else (K_min[r], K_max[r])
-                K_r, w = place(lo, hi)
-                ok = kin(K_r)[-1]
-                if ok.any() and not ok.all():     # unequal masses: the window is a part of the range; the nodes go inside it
-                    order = np.argsort(K_r); Ks, o = K_r[order], ok[order]
-                    i0, i1 = np.flatnonzero(o)[[0, -1]]
-                    if o[i0:i1 + 1].all():
-                        lo = Ks[i0] if i0 == 0 else edge(Ks[i0 - 1], Ks[i0])
-                        hi = Ks[i1] if i1 == len(Ks) - 1 else edge(Ks[i1 + 1], Ks[i1])
-                        K_r, w = place(lo, hi)
-                E_r, p_r, E_s, p_s2, cos, ok = kin(K_r)
-                if not ok.any():
-                    continue
-                w, E_r, p_r, E_s, cos = (y[ok] for y in (w, E_r, p_r, E_s, cos))
-                n = len(w)
-                mom = np.zeros((4, 3, n))
-                mom[tgt, 2] = p_t[j]
-                mom[r, 0], mom[r, 2] = p_r * np.sqrt(1.0 - cos**2), p_r * cos
-                mom[s] = -(sgn[tgt] * mom[tgt] + sgn[r] * mom[r]) / sgn[s]
-                p = {r: p_r, s: np.sqrt(p_s2[ok])}
-                f = {tgt: np.full(n, self.distributions_1d[target][j]),
-                     r: self.interpolators[legs[r]](p[r] * a), s: self.interpolators[legs[s]](p[s] * a)}
-
-                def product(skip):        # FW and BW of the three legs on the grid, leg `skip` left out
-                    FW, BW = np.ones(n), np.ones(n)
-                    for i in (tgt, r, s):
-                        if i == skip:
-                            continue
-                        if i < n_in:
-                            FW *= f[i]; BW *= 1.0 + eta[i] * f[i]
-                        else:
-                            BW *= f[i]; FW *= 1.0 + eta[i] * f[i]
-                    return FW, BW
-                FW, BW = product(None)
-                M_f, M_b = mesq(mom), mesq_b(mom)
-                FW_t[j] = pref[j] * fw_c * np.sum(w * FW * M_f)
-                BW_t[j] = pref[j] * bw_c * np.sum(w * BW * M_b)
-                for i in ([tgt, r, s] if want_J else []):           # d(gain - loss)/df of each leg on the grid
-                    if legs[i] not in offs:                         # prescribed: no columns
-                        continue
-                    FW_i, BW_i = product(i)                         # the leg enters linearly on its side, through 1 + eta f on the other
-                    dFW, dBW = (FW_i, eta[i] * BW_i) if i < n_in else (eta[i] * FW_i, BW_i)
-                    d = (1.0 if side == 'input' else -1.0) * pref[j] * w * (bw_c * dBW * M_b - fw_c * dFW * M_f)
-                    if i == tgt:
-                        J[j, offs[target] + j] += d.sum()
-                    else:
-                        i0, i1, w0, w1 = _node_weights(lg[legs[i]], p[i] * a)
-                        np.add.at(J[j], offs[legs[i]] + i0, d * w0)
-                        np.add.at(J[j], offs[legs[i]] + i1, d * w1)
-            gain, loss = (BW_t, FW_t) if side == 'input' else (FW_t, BW_t)
-            out.append((target, side, n_s, legs[k], zero_mode_in, gain, loss, J))
-        return out
-
-    def _zero_mode_decay(self, name, target, t):
-        """A 1 <-> 2 process whose single leg sits in its zero mode: the decay at rest
-        puts the daughters at p* (two-body kinematics), here as a line around q* = a p*
-        of two grid spacings' width in ln q (number density Gaussian in ln q), normalized
-        on the grid and centred so that its node sums of number and energy are those of
-        the daughters; a line this wide is held by the interpolator that the Monte Carlo
-        reads, two nodes are not. The statistics factors of the daughters are taken at p*
-        (the interpolated occupations), and the decay and the inverse decay use the same
-        line, so that their balance is that of the two-body kinematics: on a Bose-Einstein
-        state the zero mode settles at V0 f_BE(0). A decay outside the grid lands on its
-        end node. The zero mode enters as N0 (decay) and N0 + V0 (inverse decay) as in
-        _zero_mode_rates. Decays per comoving volume and time: N0 sym |M|^2 p*/(8 pi m^2 g).
-        Same return entry; J through the interpolation at p* (_node_weights)."""
-        cfg = self.process_configs[name]
-        one = 'input' if cfg['n_in'] == 1 else 'output'
-        parent, pair = cfg[one][0], cfg['output' if one == 'input' else 'input']
-        side = 'output' if one == 'input' else 'input'
-        n_s = pair.count(target)
-        other = pair[1] if pair[0] == target else pair[0]
-        m_p, g_p = self.species_mass[parent], self.species_dof.get(parent, 1)
-        m1, m2 = self.species_mass.get(target, 0.0), self.species_mass.get(other, 0.0)
-        p_star2 = ((m_p**2 + m1**2 - m2**2) / (2.0 * m_p))**2 - m1**2
-        q = self.r_grids[target]
-        want_J = getattr(self, '_want_jacobian', False)
+        r, s = [i for i in range(len(legs)) if i != tgt and i not in rest]
+        fw, bw, dfw, dbw = self._rest_weights(legs, n_in, rest, a)
+        W = sum(sgn[i] * mass[i] for i in rest)       # the energy the legs at rest bring to the input side
+        bounded = sgn[r] == sgn[s]                    # r and s on one side: K_r + K_s = S, else K_r free
+        sum_f, sum_b = np.zeros_like(q), np.zeros_like(q)
         J = np.zeros((len(q), self._n_jacobian_cols())) if want_J else None
-        if p_star2 <= 0.0:                                   # closed
-            return (target, side, n_s, parent, one == 'input', np.zeros_like(q), np.zeros_like(q), J)
+        for j in range(len(q)):
+            A = -(sgn[tgt] * E_t[j] + W)              # sgn_r E_r + sgn_s E_s
+            S = sgn[r] * A - mass[r] - mass[s]
+
+            def kin(K_r):
+                E_r = K_r + mass[r]
+                p_r = np.sqrt(K_r * (K_r + 2.0 * mass[r]))
+                E_s = (A - sgn[r] * E_r) / sgn[s]
+                p_s2 = E_s**2 - mass[s]**2
+                cos = (p_s2 - p_t[j]**2 - p_r**2) / (2.0 * sgn[tgt] * sgn[r] * p_t[j] * p_r)
+                return E_r, p_r, E_s, p_s2, cos, (E_s - mass[s] >= K_min[s]) & (np.abs(cos) <= 1.0)
+
+            def place(lo, hi):        # nodes over [lo, hi]; bounded: two sets, each in the log of its leg's K
+                if not bounded:
+                    return nodes(lo, hi)
+                K1, w1 = nodes(lo, min(0.5 * S, hi))
+                K2, w2 = nodes(S - hi, min(0.5 * S, S - lo))
+                return np.concatenate([K1, S - K2]), np.concatenate([w1, w2])
+
+            def edge(K_out, K_in):    # the kinematic edge between a point outside and one inside, by bisection
+                for _ in range(40):
+                    K_mid = 0.5 * (K_out + K_in)
+                    K_out, K_in = (K_out, K_mid) if kin(np.array([K_mid]))[-1][0] else (K_mid, K_in)
+                return K_in
+
+            lo, hi = (K_min[r], S - K_min[s]) if bounded else (K_min[r], K_max[r])
+            K_r, w = place(lo, hi)
+            ok = kin(K_r)[-1]
+            if ok.any() and not ok.all():     # unequal masses: the window is a part of the range; the nodes go inside it
+                order = np.argsort(K_r); Ks, o = K_r[order], ok[order]
+                i0, i1 = np.flatnonzero(o)[[0, -1]]
+                if o[i0:i1 + 1].all():
+                    lo = Ks[i0] if i0 == 0 else edge(Ks[i0 - 1], Ks[i0])
+                    hi = Ks[i1] if i1 == len(Ks) - 1 else edge(Ks[i1 + 1], Ks[i1])
+                    K_r, w = place(lo, hi)
+            E_r, p_r, E_s, p_s2, cos, ok = kin(K_r)
+            if not ok.any():
+                continue
+            w, E_r, p_r, E_s, cos = (y[ok] for y in (w, E_r, p_r, E_s, cos))
+            n = len(w)
+            mom = np.zeros((len(legs), 3, n))
+            mom[tgt, 2] = p_t[j]
+            mom[r, 0], mom[r, 2] = p_r * np.sqrt(1.0 - cos**2), p_r * cos
+            mom[s] = -(sgn[tgt] * mom[tgt] + sgn[r] * mom[r]) / sgn[s]
+            p = {r: p_r, s: np.sqrt(p_s2[ok])}
+            f = {tgt: np.full(n, self.distributions_1d[target][j]),
+                 r: self.interpolators[legs[r]](p[r] * a), s: self.interpolators[legs[s]](p[s] * a)}
+
+            def product(skip):        # FW and BW of the three legs in motion, leg `skip` left out
+                FW, BW = np.ones(n), np.ones(n)
+                for i in (tgt, r, s):
+                    if i == skip:
+                        continue
+                    if i < n_in:
+                        FW *= f[i]; BW *= 1.0 + eta[i] * f[i]
+                    else:
+                        BW *= f[i]; FW *= 1.0 + eta[i] * f[i]
+                return FW, BW
+            FW, BW = product(None)
+            M_f, M_b = mesq(mom), mesq_b(mom)
+            sum_f[j], sum_b[j] = np.sum(w * FW * M_f), np.sum(w * BW * M_b)
+            for i in ([tgt, r, s] if want_J else []):           # d(gain - loss)/df of each leg in motion
+                if legs[i] not in offs:                         # prescribed: no columns
+                    continue
+                FW_i, BW_i = product(i)                         # the leg enters linearly on its side, through 1 + eta f on the other
+                dFW, dBW = (FW_i, eta[i] * BW_i) if i < n_in else (eta[i] * FW_i, BW_i)
+                d = (1.0 if side == 'input' else -1.0) * pref[j] * w * (bw * dBW * M_b - fw * dFW * M_f)
+                if i == tgt:
+                    J[j, offs[target] + j] += d.sum()
+                else:
+                    i0, i1, w0, w1 = _node_weights(lg[legs[i]], p[i] * a)
+                    np.add.at(J[j], offs[legs[i]] + i0, d * w0)
+                    np.add.at(J[j], offs[legs[i]] + i1, d * w1)
+        FW_t, BW_t = pref * fw * sum_f, pref * bw * sum_b
+        gain, loss = (BW_t, FW_t) if side == 'input' else (FW_t, BW_t)
+        dnet = {c: (1.0 if side == 'input' else -1.0) * pref * (dbw[c] * sum_b - dfw[c] * sum_f) for c in dfw}
+        return gain, loss, dnet, J
+
+    def _zero_mode_line(self, name, tgt, rest, t):
+        """A zero-mode term with two legs in motion -- the target (slot tgt) and one other --
+        and the legs `rest` at rest in their zero modes. Momentum conservation gives the two
+        the same |p| and energy conservation fixes it at p*: on one side of the reaction they
+        are a pair made by the legs at rest (the decay of a zero mode, the annihilation of
+        two) or annihilating into them; on opposite sides one turns into the other, a leg at
+        rest taken up or left behind (a decay with one daughter into its zero mode). On the
+        grid the term is a line around q* = a p* of two grid spacings' width in ln q (number
+        density Gaussian in ln q), normalized on the grid and centred so that its node sums
+        of number and energy are those of the target at p*; a line this wide is held by the
+        interpolator that the Monte Carlo reads, two nodes are not. The statistics factors of
+        the two legs are taken at p* (the interpolated occupations), and the two directions
+        use the same line, so that their balance is that of the kinematics: on a Bose-Einstein
+        state the zero modes settle at V0 f_BE(0). A line outside the grid lands on its end
+        node. Reactions per comoving volume and time: a^3 sym |M|^2 p* / (4 pi |E_t +- E_u|)
+        (+ on one side, - on opposite sides) times the weights of the legs at rest
+        (_rest_weights) and the statistics. Returns as _zero_mode_rates, J through the
+        interpolation at p* (_node_weights); None when the kinematics is closed, and for two
+        legs of equal mass on opposite sides with nothing left for them (forward scattering:
+        no p* is singled out)."""
+        cfg = self.process_configs[name]
+        legs = cfg['input'] + cfg['output']
+        n_in = cfg['n_in']
+        u = next(i for i in range(len(legs)) if i != tgt and i not in rest)
+        target, side = legs[tgt], 'input' if tgt < n_in else 'output'
+        sgn = [1.0] * n_in + [-1.0] * cfg['n_out']
+        mass = [self.species_mass.get(l, 0.0) for l in legs]
+        m_t, m_u = mass[tgt], mass[u]
+        W = sum(sgn[i] * mass[i] for i in rest)       # the energy the legs at rest bring to the input side
+        if sgn[tgt] == sgn[u]:                        # a pair: E_t + E_u is what the legs at rest give or take
+            E_pair = -sgn[tgt] * W
+            if E_pair <= 0.0:
+                return None
+            E_t = (E_pair**2 + m_t**2 - m_u**2) / (2.0 * E_pair)
+            E_u, spread = E_pair - E_t, E_pair
+        else:                                         # one turns into the other: E_t - E_u is what they give or take
+            D = -sgn[tgt] * W
+            if D == 0.0:
+                return None
+            E_t = 0.5 * ((m_t**2 - m_u**2) / D + D)
+            E_u, spread = E_t - D, abs(D)
+        p_star2 = E_t**2 - m_t**2
+        if not (p_star2 > 0.0 and E_t > 0.0 and E_u > 0.0):   # closed
+            return None
         a = self.scale_factor(t)
         p_star = np.sqrt(p_star2)
         q_star = a * p_star
-        E = np.sqrt(q * q + (a * m1)**2)
-        E_star = np.sqrt(q_star**2 + (a * m1)**2)
+        q = self.r_grids[target]
+        E = np.sqrt(q * q + (a * m_t)**2)
+        E_star = np.sqrt(q_star**2 + (a * m_t)**2)
         w = grid_weights(q) * q * q * self.species_dof.get(target, 1) / (2.0 * np.pi**2)
         lq = np.log(q); sig = 2.0 * (lq[-1] - lq[0]) / (len(q) - 1)
         line = lambda c: np.exp(-0.5 * ((lq - c) / sig)**2) / q**3
@@ -1941,33 +1998,70 @@ class BEST:
             occ = line(brentq(mean_E, lo, hi))                # the line, centred on the energy
         else:                                                 # outside the grid: the end node
             occ = np.zeros_like(q); occ[0 if q_star <= q[0] else -1] = 1.0
-        profile = occ / (w @ occ)                             # one daughter per comoving volume
-        mom = np.zeros((3, 3, 1))
-        d1, d2 = (1, 2) if one == 'input' else (0, 1)
-        mom[d1, 2, 0], mom[d2, 2, 0] = p_star, -p_star
-        rate = cfg['symmetry_factor'] * p_star / (8.0 * np.pi * m_p**2 * g_p)   # per particle of the zero mode, times |M|^2
-        gam_f = rate * float(cfg['matrix_element_squared'](mom)[0])
-        gam_b = rate * float(self._reverse_matrix_element(name)(mom)[0])
-        if one == 'output':                                   # the decay is the reverse of the registered direction
-            gam_f, gam_b = gam_b, gam_f
-        eta = {'boson': 1.0, 'fermion': -1.0}
-        e_t, e_o = eta.get(self.species_config[target], 0.0), eta.get(self.species_config[other], 0.0)
-        f_t = float(self.interpolators[target](q_star))         # the daughters' occupations at p*
-        f_o = f_t if other == target else float(self.interpolators[other](q_star))
-        N0 = self.zero_mode[parent]
-        V0 = g_p * self.q_min**3 / (6.0 * np.pi**2)
-        line_d, line_i = N0 * gam_f * n_s * profile, (N0 + V0) * gam_b * n_s * profile
-        decay, inverse = line_d * (1.0 + e_t * f_t) * (1.0 + e_o * f_o), line_i * f_t * f_o
-        if want_J:                                            # d(decay - inverse)/df of the two daughters, through the interpolation at p*
+        profile = occ / (w @ occ)                             # one particle per comoving volume
+        mom = np.zeros((len(legs), 3, 1))
+        mom[tgt, 2, 0], mom[u, 2, 0] = p_star, -sgn[tgt] * sgn[u] * p_star
+        rate = cfg[side].count(target) * a**3 * cfg['symmetry_factor'] * p_star / (4.0 * np.pi * spread)
+        fw, bw, dfw, dbw = self._rest_weights(legs, n_in, rest, a)
+        R_f = rate * float(cfg['matrix_element_squared'](mom)[0])
+        R_b = rate * float(self._reverse_matrix_element(name)(mom)[0])
+        eta = {i: {'boson': 1.0, 'fermion': -1.0}.get(self.species_config[legs[i]], 0.0) for i in (tgt, u)}
+        f = {i: float(self.interpolators[legs[i]](q_star)) for i in (tgt, u)}     # the occupations at p*
+
+        def product(skip):            # FW and BW of the two legs in motion, leg `skip` left out
+            FW, BW = 1.0, 1.0
+            for i in (tgt, u):
+                if i == skip:
+                    continue
+                if i < n_in:
+                    FW *= f[i]; BW *= 1.0 + eta[i] * f[i]
+                else:
+                    BW *= f[i]; FW *= 1.0 + eta[i] * f[i]
+            return FW, BW
+        FW, BW = product(None)
+        forward, reverse = R_f * fw * FW * profile, R_b * bw * BW * profile
+        gain, loss = (reverse, forward) if side == 'input' else (forward, reverse)
+        sign = 1.0 if side == 'input' else -1.0
+        dnet = {c: sign * (R_b * dbw[c] * BW - R_f * dfw[c] * FW) * profile for c in dfw}
+        J = None
+        if getattr(self, '_want_jacobian', False):            # d(gain - loss)/df of the two legs, through the interpolation at p*
             offs = self._jacobian_offsets()
-            d_t = line_d * e_t * (1.0 + e_o * f_o) - line_i * f_o
-            d_o = line_d * (1.0 + e_t * f_t) * e_o - line_i * f_t
-            for sp, d in ((target, d_t), (other, d_o)):
-                if sp in offs:
-                    i0, i1, w0, w1 = _node_weights(np.log(self.r_grids[sp]), np.array([q_star]))
-                    J[:, offs[sp] + i0[0]] += d * w0[0]
-                    J[:, offs[sp] + i1[0]] += d * w1[0]
-        return (target, side, n_s, parent, one == 'input', decay, inverse, J)
+            J = np.zeros((len(q), self._n_jacobian_cols()))
+            for i in (tgt, u):
+                if legs[i] not in offs:                       # prescribed: no columns
+                    continue
+                FW_i, BW_i = product(i)
+                dFW, dBW = (FW_i, eta[i] * BW_i) if i < n_in else (eta[i] * FW_i, BW_i)
+                d = sign * (R_b * bw * dBW - R_f * fw * dFW) * profile
+                i0, i1, w0, w1 = _node_weights(np.log(self.r_grids[legs[i]]), np.array([q_star]))
+                J[:, offs[legs[i]] + i0[0]] += d * w0[0]
+                J[:, offs[legs[i]] + i1[0]] += d * w1[0]
+        return gain, loss, dnet, J
+
+    def _zero_mode_sampled(self, name, tgt, rest, t):
+        """A zero-mode term with four or more legs in motion -- the target (slot tgt) among them --
+        and the legs `rest` at rest in their zero modes: the integral over the legs in motion is
+        BEST's Monte Carlo of the process with the legs at rest frozen (E = m, p = 0, not
+        integrated, no statistics; collision_integrand_batch), on integrators of its own, one
+        rate pass over the target's grid (collective, like every rate pass). The pass returns the
+        forward and the reverse integral on common samples; the weights of the legs at rest
+        (_rest_weights) multiply them here. Returns as _zero_mode_rates; J is the Monte Carlo
+        Jacobian row of the pass, the two directions weighted alike."""
+        cfg = self.process_configs[name]
+        legs = cfg['input'] + cfg['output']
+        n_in = cfg['n_in']
+        target, side = legs[tgt], 'input' if tgt < n_in else 'output'
+        n_s = cfg[side].count(target)
+        fw, bw, dfw, dbw = self._rest_weights(legs, n_in, rest, self.scale_factor(t))
+        self._legs_at_rest, self._rest_scale, self._force_target_side = tuple(rest), (fw, bw), side
+        self._integrator_suffix = ('_in' if side == 'input' else '_out') + '_rest' + '_'.join(str(i) for i in rest)
+        _, kf, kb = self._compute_rates_single_pass([name], t=t, species_filter=[target])
+        self._legs_at_rest, self._rest_scale, self._force_target_side, self._integrator_suffix = (), (1.0, 1.0), None, ''
+        kf, kb = n_s * kf[(target, name)], n_s * kb[(target, name)]      # signed with the side, like the rates of a process
+        gain, loss = (bw * kb, fw * kf) if side == 'input' else (-fw * kf, -bw * kb)
+        dnet = {c: dbw[c] * kb - dfw[c] * kf for c in dfw}
+        J = n_s * self._pass_jacobian[(target, name)] if getattr(self, '_want_jacobian', False) else None
+        return gain, loss, dnet, J
 
     def _fermion_ceiling(self, a):
         """Fermion occupations past 1 are set to F_FERMION_MAX and reported, as negative ones
@@ -1984,42 +2078,46 @@ class BEST:
                 self.interpolators[species] = ExtrapolatingInterp(
                     q, f, mass=self.species_mass.get(species, 0.0), stat='fermion', a=a)
 
-    def _zero_mode_key(self, term):
-        """(process, species of the zero mode, its leg on the input side) of a zero-mode term; for a
-        self-reverse process the two directions are the same reaction and the side is
-        immaterial (True)."""
-        name, zm, zero_mode_in = term[0], term[4], term[5]
-        cfg = self.process_configs[name]
-        return name, zm, True if sorted(cfg['input']) == sorted(cfg['output']) else zero_mode_in
-
-    def _zero_mode_stoichiometry(self, name, zm, zero_mode_in):
-        """The species whose grid counts the reactions of a zero-mode leg, and the factor that
-        turns the exchange of that grid into the change of the zero mode: per reaction the
-        zero mode changes by -1 (consumed) or +1 (produced) and the grid of its own
-        species by d_c + 1 or d_c - 1 (d: output count minus input count); when that is
-        zero, another species whose number the reaction changes counts them."""
+    def _zero_mode_stoichiometry(self, name, comp):
+        """The grid that counts the reactions of a class of zero-mode terms -- a process with given
+        numbers of legs at rest, comp = ((species, on the input side, on the output side), ...)
+        -- and the factors that turn the exchange of that grid into the changes of the zero
+        modes: per reaction a zero mode changes by its legs at rest on the output side minus
+        those on the input side, and the grid of a species by its output count minus its input
+        count, less that. The first species of the legs at rest whose grid the reaction changes
+        counts the reactions, else the first other one, through all its terms of the class. A
+        reaction that changes no grid (a b c0 <-> a b: every species in motion leaves as it
+        came) is counted on the input side, by the terms of the first species in motion
+        there, one reaction for each of its legs in motion.
+        Returns (species, side or None for both, {zero mode: factor})."""
         cfg = self.process_configs[name]
         d = {s: cfg['output'].count(s) - cfg['input'].count(s) for s in cfg['input'] + cfg['output']}
-        per = d[zm] + (1 if zero_mode_in else -1)
-        s = zm if per != 0 else next(s for s in d if s != zm and d[s] != 0)
-        return s, (-1.0 if zero_mode_in else 1.0) / (per if s == zm else d[s])
+        zero = {c: k_out - k_in for c, k_in, k_out in comp}
+        grid = {s: d[s] - zero.get(s, 0) for s in d}
+        counting = [s for s in list(zero) + list(d) if grid[s] != 0]
+        if counting:
+            return counting[0], None, {c: x / grid[counting[0]] for c, x in zero.items()}
+        at_rest_in = {c: k_in for c, k_in, k_out in comp}
+        s, in_motion = next((s, cfg['input'].count(s) - at_rest_in.get(s, 0)) for s in cfg['input']
+                            if cfg['input'].count(s) > at_rest_in.get(s, 0))
+        return s, 'input', {c: -x / in_motion for c, x in zero.items()}
 
-    def _zero_mode_system(self, species, net, gain, loss, terms, terms_bump, J=None):
+    def _zero_mode_system(self, species, net, gain, loss, terms, J=None):
         """The linearized system of an exponential step with the tracked zero modes of the terms
         as state variables, x = (f of the species, their N0): F = (net rates, dN0/dt)
         and the Jacobian -- the grid's (J over all species, else the diagonal of
-        assemble_A_Gamma) with, for every zero mode, the column dC/dN0 (the terms are affine in
-        N0, the two evaluations give it exactly), the row d(dN0/dt)/df (the weighted column
-        sums of the term's own J, else the same diagonal split), and the corner
-        d(dN0/dt)/dN0, all through the stoichiometry of each zero-mode leg. The weighted sums of
-        the zero mode's column and of its row vanish, so the step conserves the number of every
-        zero-mode leg's reaction exactly, and a zero mode whose exchange with the grid is fast against
-        the step relaxes within it like a stiff node.
+        assemble_A_Gamma) with, for every zero mode, the column dC/dN0 (the terms' own
+        derivatives), the row d(dN0/dt)/df (the weighted column sums of the term's own J, else
+        the same diagonal split), and the corners d(dN0/dt)/dN0, all through the stoichiometry
+        of each class of terms. The weighted sums of a zero mode's column and of its row
+        vanish, so the step conserves the number of every class's reactions exactly, and a zero
+        mode whose exchange with the grid is fast against the step relaxes within it like a
+        stiff node.
         Returns (x0, F, Jx, zms), zms the species of the zero modes in the order of their rows."""
         sizes = [len(self.r_grids[sp]) for sp in species]
         offs = dict(zip(species, np.cumsum([0] + sizes[:-1])))
         n = sum(sizes)
-        zms = sorted({t[4] for t in terms if t[4] in self.species_list})
+        zms = sorted({c for term in terms for c in term[5] if c in self.species_list})
         N = n + len(zms)
         col = {c: n + i for i, c in enumerate(zms)}
         x0 = np.concatenate([self.distributions_1d[sp] for sp in species] + [np.array([self.zero_mode[c] for c in zms])])
@@ -2032,27 +2130,26 @@ class BEST:
                                                          self.species_config.get(sp, 'boson'))[1])
             else:
                 Jx[seg, :n] = J[sp]
-        for term, term_b in zip(terms, terms_bump):
-            name, sp, side, n_s, zm, zero_mode_in, g, l, J_t = term
-            if zm not in col:                   # a prescribed species keeps its zero mode
-                continue
-            V0 = self.species_dof.get(zm, 1) * self.q_min**3 / (6.0 * np.pi**2)
-            dC = (term_b[6] - g - (term_b[7] - l)) / V0
+        for name, sp, comp, g, l, dnet, J_t, side in terms:
+            cols = [c for c in dnet if c in col]            # a prescribed species keeps its zero mode
             if sp in offs:
-                Jx[offs[sp]:offs[sp] + len(g), col[zm]] += dC
-            s, factor = self._zero_mode_stoichiometry(*self._zero_mode_key(term))
-            if sp != s:
+                for c in cols:
+                    Jx[offs[sp]:offs[sp] + len(g), col[c]] += dnet[c]
+            s, counts_side, factor = self._zero_mode_stoichiometry(name, comp)
+            if sp != s or counts_side not in (None, side):
                 continue
             q = self.r_grids[sp]
             w = grid_weights(q) * q * q * self.species_dof.get(sp, 1) / (2.0 * np.pi**2)
-            F[col[zm]] += factor * (w @ (g - l))
-            Jx[col[zm], col[zm]] += factor * (w @ dC)
-            if sp in offs and J is not None:
-                Jx[col[zm], :n] += factor * (w @ J_t)
-            elif sp in offs:
-                eta = {'boson': 1.0, 'fermion': -1.0}.get(self.species_config[sp], 0.0)
-                f = np.maximum(self.distributions_1d[sp], 1e-300)
-                Jx[col[zm], offs[sp]:offs[sp] + len(g)] += factor * w * (eta * g / (1.0 + eta * f) - l / f)
+            for zm in [c for c in factor if c in col]:
+                F[col[zm]] += factor[zm] * (w @ (g - l))
+                for c in cols:
+                    Jx[col[zm], col[c]] += factor[zm] * (w @ dnet[c])
+                if sp in offs and J is not None:
+                    Jx[col[zm], :n] += factor[zm] * (w @ J_t)
+                elif sp in offs:
+                    eta = {'boson': 1.0, 'fermion': -1.0}.get(self.species_config[sp], 0.0)
+                    f = np.maximum(self.distributions_1d[sp], 1e-300)
+                    Jx[col[zm], offs[sp]:offs[sp] + len(g)] += factor[zm] * w * (eta * g / (1.0 + eta * f) - l / f)
         return x0, F, Jx, zms
 
     def _floor_report(self, x_new, x0, sps, sizes, method):
@@ -2082,25 +2179,25 @@ class BEST:
         (euler, the two stages of heun): a term with the coefficients of the state f_ref
         exchanges at a node weight [gain (1 + eta f_eval)/(1 + eta f_ref) - loss f_eval/f_ref],
         f_eval = f_ref and weight = dt for an explicit step. The stoichiometry of the
-        reaction with that zero-mode leg (_zero_mode_stoichiometry) turns the exchange into the
-        zero mode's change. With weight = 1 and apply=False it returns the rates dN0/dt. The zero
+        class of the term (_zero_mode_stoichiometry) turns the exchange into the changes of its
+        zero modes. With weight = 1 and apply=False it returns the rates dN0/dt. The zero
         mode of a prescribed species is not changed. Returns {species: dN}."""
         changes = {}
-        for term in (self._zero_mode_terms if terms is None else terms):
-            name, target, side, n_s, zm, zero_mode_in, gain, loss = term[:8]
-            name, zm, zero_mode_in = self._zero_mode_key(term)
+        for name, target, comp, gain, loss, _, _, side in (self._zero_mode_terms if terms is None else terms):
             q = self.r_grids[target]
             w = grid_weights(q) * q * q * self.species_dof.get(target, 1) / (2.0 * np.pi**2)
             eta = {'boson': 1.0, 'fermion': -1.0}.get(self.species_config[target], 0.0)
             f0 = np.maximum(f_ref.get(target, self.distributions_1d[target]), 1e-300)
             fe = f_eval.get(target, f0)
             c = weight.get(target, 0.0) if isinstance(weight, dict) else weight   # no correction for a prescribed species
-            key = (name, zm, zero_mode_in, target)
+            key = (name, comp, target, side)
             changes[key] = changes.get(key, 0.0) + w @ (c * (gain * (1.0 + eta * fe) / (1.0 + eta * f0) - loss * fe / f0))
         dN = {}
-        for name, zm, zero_mode_in in {k[:3] for k in changes}:
-            s, factor = self._zero_mode_stoichiometry(name, zm, zero_mode_in)
-            dN[zm] = dN.get(zm, 0.0) + factor * changes[(name, zm, zero_mode_in, s)]
+        for name, comp in dict.fromkeys(k[:2] for k in changes):
+            s, counts_side, factor = self._zero_mode_stoichiometry(name, comp)
+            counted = sum(changes.get((name, comp, s, side), 0.0) for side in ('input', 'output') if counts_side in (None, side))
+            for zm, x in factor.items():
+                dN[zm] = dN.get(zm, 0.0) + x * counted
         if apply:
             for zm, x in dN.items():
                 if zm not in self.species_list:
@@ -2333,7 +2430,7 @@ class BEST:
             if self._zero_mode_terms:                   # the zero modes: the change the step would make
                 if method in ('exprb', 'exprb2', 'exprb_full', 'exprb_seq'):
                     x0, F, Jx, zms = self._zero_mode_system(self.species_list, k1, self.gain_rates, self.loss_rates,
-                                                         self._zero_mode_terms, self._zero_mode_terms_bump,
+                                                         self._zero_mode_terms,
                                                          self.jacobian if method == 'exprb_full' else None)
                     dN = dict(zip(zms, _phi_apply(Jx, F, dt)[len(x0) - len(zms):]))
                 else:
@@ -2432,8 +2529,7 @@ class BEST:
             # Gamma). Dropped/noisy modes have gain=loss=0 -> A=Gamma=0 -> held.
             if self.world_rank == 0:
                 if self._zero_mode_terms:               # with zero modes: the extended system, f + dt phi1(dt J) F
-                    x0, F, Jx, zms = self._zero_mode_system(sps, k1, self.gain_rates, self.loss_rates,
-                                                         self._zero_mode_terms, self._zero_mode_terms_bump)
+                    x0, F, Jx, zms = self._zero_mode_system(sps, k1, self.gain_rates, self.loss_rates, self._zero_mode_terms)
                     unpack(x0 + _phi_apply(Jx, F, dt_actual), zms)
                 for species in ([] if self._zero_mode_terms else self.species_list):
                     self.distributions_1d[species] = exprb_update(
@@ -2453,8 +2549,7 @@ class BEST:
             zms_x = []
             if self.world_rank == 0:
                 if self._zero_mode_terms:               # with zero modes: the extended system (predictor, then the phi2 correction)
-                    x0, F1, Jx1, zms_x = self._zero_mode_system(sps, k1, self.gain_rates, self.loss_rates,
-                                                             self._zero_mode_terms, self._zero_mode_terms_bump)
+                    x0, F1, Jx1, zms_x = self._zero_mode_system(sps, k1, self.gain_rates, self.loss_rates, self._zero_mode_terms)
                     x_pred = x0 + _phi_apply(Jx1, F1, dt_actual)
                     unpack(x_pred, zms_x)
                 for species in ([] if self._zero_mode_terms else self.species_list):
@@ -2472,8 +2567,7 @@ class BEST:
             k2, _, _ = self._compute_rates_vegas(active_processes, t=self.current_time + dt_actual)
             if self.world_rank == 0:
                 if zms_x:
-                    F2 = self._zero_mode_system(sps, k2, self.gain_rates, self.loss_rates,
-                                           self._zero_mode_terms, self._zero_mode_terms_bump)[1]
+                    F2 = self._zero_mode_system(sps, k2, self.gain_rates, self.loss_rates, self._zero_mode_terms)[1]
                     x_new = x_pred + _phi_apply(Jx1, F2 - F1 - Jx1 @ (x_pred - x0), dt_actual, 2)
                     self._floor_report(x_new, x0, sps, sizes, 'exprb2')
                     unpack(x_new, zms_x)
@@ -2510,7 +2604,7 @@ class BEST:
             if self.world_rank == 0:
                 # the full Jacobian over all species; with zero modes the extended system of _zero_mode_system
                 x0, F, Jx, zms = self._zero_mode_system(sps, k1, self.gain_rates, self.loss_rates,
-                                                     self._zero_mode_terms, self._zero_mode_terms_bump, self.jacobian)
+                                                     self._zero_mode_terms, self.jacobian)
                 x_new = x0 + _phi_apply(Jx, F, dt_actual)
                 # Negative occupations are set to the floor; the number moved by this
                 # per species is reported as a diagnostic of the linearization.
@@ -2577,7 +2671,7 @@ class BEST:
                     if terms_u:                    # with zero modes: the unit's extended system
                         x0, F, Jx, zms = self._zero_mode_system(
                             sps, {sp: gain_u[sp] - loss_u[sp] for sp in sps}, gain_u, loss_u,
-                            [self._zero_mode_terms[k] for k in terms_u], [self._zero_mode_terms_bump[k] for k in terms_u])
+                            [self._zero_mode_terms[k] for k in terms_u])
                         unpack(x0 + _phi_apply(Jx, F, dt_actual), zms)
                     for species in ([] if terms_u else sps):
                         stat = self.species_config.get(species, 'boson')

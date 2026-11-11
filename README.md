@@ -297,7 +297,7 @@ solver.step_hook = medium
 solver.set_mass_func('phi', lambda t: np.sqrt(m0 * m0 + solver.m_th2))
 ```
 
-### Zero mode
+### Zero-momentum mode
 
 ```python
 solver.initialize_species('phi', lambda q: 0.0 * q, stat='boson', mass=4.0, n0=0.25)   # a condensate: nothing on the grid
@@ -308,71 +308,61 @@ A massive boson carries, next to its grid, its zero mode — the states
 p < q_min as one number, `solver.zero_mode[species]` (comoving, a³ n₀). It
 starts with what the initial distribution holds below q_min, plus
 `initialize_species(..., n0=)` for a species that starts as a condensate;
-fermions and massless bosons have none. Vegas leaves p < q_min to this
-variable. A 2 → 2 process with a leg in the zero mode is integrated with that
-leg at rest, the two other legs fixed up to one energy — BEST's own integrand,
-|M|², symmetry factor, g and statistics included, without Vegas — and the zero
-mode enters as N₀ when consumed and as N₀ + V₀ when produced,
-V₀ = g q_min³/(6π²) its states, the spontaneous part. A 1 ↔ 2 process whose
-single leg is in its zero mode decays at rest onto a line of two grid spacings
-around p* (its number exact, its energy while a p* lies on the grid — beyond
-q_max the daughters go to the end node; a narrower line is not held by the
-interpolator), with the statistics of the daughters at p* and the same line
-for the decay and the inverse decay, so that on a Bose–Einstein state the
-zero mode settles at V₀ f_BE(0); the width of the line is the grid's, not
-the physics', harmless while scattering spreads the daughters faster than
-the decay feeds them. The line, which reaches six spacings from p*, has to stay
-clear of the top max(10, n_grid/10) nodes — they fit the extrapolation that Vegas reads above
-q_max, and a line among them bends it — so an expansion run takes q_max above
-a_end p* by that margin. The
-exponential steps (`exprb`, `exprb2`, `exprb_seq`, `exprb_full`) take the
-zero mode as a state variable next to the grid: its coupling to the nodes is
-in the linearization, the reactions of each zero-mode leg are counted once,
-on the grid, and given to the zero mode — their number is conserved by
-construction, while nothing imposes energy conservation, which is the check —
-and a zero mode that exchanges fast with the grid relaxes within the step
-like a stiff node; the explicit steps give the zero mode what its terms
-exchanged. With `exprb_full` the zero-mode terms enter the full Jacobian like
-the Vegas rates, with the nodes they couple; the diagonal steps hold a node's
-partners over the step, and at an onset that empties the lowest nodes into
-the zero mode within a step the gain those nodes fed to the rest of the grid
-outlives them — number and energy are created. A condensate decaying into a
-gas that condenses in turn does this (`examples/inflaton_bec.py`): use
-`exprb_full` there, or a step that resolves the onset.
-Number and energy of the zero mode count in `compute_moments`, the history
-(`'n0'`) and checkpoints. A prescribed species keeps its zero mode as it
-keeps its grid; a condensate decaying into a prescribed bath still depletes.
-The zero mode stands for p < q_min as one point: a process whose momenta are
-not large against q_min feels that (a cold gas with q_min at a third of its
-thermal momentum: percent level in its rates) — lower q_min then. Not
-integrated: a 2 → 2 process with both legs of a pair in zero modes (the N₀²
-part — a condensate annihilating into lighter particles; with equal mass
-sums on the two sides the channel has no phase space), a 1 ↔ 2 process with
-one of the pair in a zero mode, processes of five or more legs; the last two
-are said once.
+fermions and massless bosons have none. So a boson whose number exceeds what
+the Bose–Einstein distribution with μ = m holds at its energy condenses by
+itself, a condensate evaporates when expansion takes it below the critical
+line, and a species initialized with `n0` only is a condensate decaying into
+its daughters. Number and energy of the zero mode count in `compute_moments`,
+the history (`'n0'`) and checkpoints; a prescribed species keeps its zero
+mode as it keeps its grid.
 
-So a boson whose number exceeds what the Bose–Einstein distribution with
-μ = m holds at its energy condenses by itself — the lowest nodes used to run
-away — and a condensate evaporates when expansion takes it below the
-critical line; a species initialized with `n0` only is a condensate decaying
-into its daughters. The moment the zero mode becomes visible follows from the
-spontaneous term V₀ and moves with q_min; the condensed state does not. Outside the kinetic description: mean-field effects on the
-dispersion, and the coherence of a condensate — the equation keeps
-occupations, not phases, so a decay is enhanced by stimulated emission,
-(1 + f)², not by parametric resonance; for a coherently oscillating parent
-the resonance (the occupation of the first band grows at about q m/2 for a
-narrow resonance,
-q the resonance parameter of its coupling to the daughters) has to be slower
-than what empties the band — scattering, the parent's own decay, expansion —
-for the kinetic description to hold. With `adapt_dt` the zero mode counts like
-a node; the onset of condensation is a fast transient, kept resolved or
-stepped through at a fixed dt. `scripts/check_zero_mode.py` checks detailed
-balance with the zero mode at its own equilibrium, energy conservation and
-the normalization against the Vegas rate; `examples/inflaton_bec.py` runs a
-condensate (an inflaton with nothing on its grid) decaying into a quartically
-self-interacting boson that thermalizes and condenses in turn, and compares
-the end state with the equilibrium that the initial energy and number fix
-(`scripts/plot_bec.py` draws its checkpoint).
+Every part of a process with legs in zero modes is integrated with those legs
+at rest, each entering as N₀ when consumed and as N₀ + V₀ when produced
+(V₀ = g q_min³/(6π²), its states: the spontaneous part), so that on a
+Bose–Einstein state a zero mode settles at V₀ f_BE(0). With two legs left in
+motion the kinematics fixes their momentum, p*, and the part is a line on the
+grid (a zero mode decaying at rest, or two annihilating, into a pair); with
+three it is one integration without Vegas (a 2 → 2 process with one leg at
+rest); with four or more each part is a Monte Carlo pass of its own (a 2 ↔ 3
+process with one leg at rest: for φφ ↔ φφφ four passes next to its two),
+which `solver.zero_mode_sampled = False` leaves out.
+
+- **Onset.** The onset of condensation is a fast transient, and the diagonal
+  exponential steps create number and energy when it empties the lowest nodes
+  within a step: use `exprb_full` there, at a fixed dt that resolves the
+  onset. The totals of number and energy are the check. With `adapt_dt` the
+  zero mode counts like a node.
+- **Conservation.** The reactions of a part are counted on one grid and given
+  to its zero modes: number is exact between the two and holds between
+  species to the accuracy of the grid; energy is not imposed.
+- **The line.** It is two grid spacings wide (the interpolator does not hold
+  a narrower one) and carries its number exactly, its energy while p* lies on
+  the grid. It reaches six spacings from p* and, if it carries more than
+  scattering smooths away, has to stay clear of the top max(10, n_grid/10)
+  nodes, which fit the extrapolation above q_max: an expansion run takes
+  q_max that far above a_end p*. The width is the grid's, not the physics':
+  the particles still on the line enter the statistics at p* with an
+  occupation that grows with n_grid, and the result is independent of the
+  grid only while that occupation stays well below one — scattering or
+  expansion spreading them faster than the line feeds them.
+- **q_min.** The zero mode stands for p < q_min as one point: lower q_min
+  when the momenta of a process are not large against it. The moment a zero
+  mode becomes visible moves with q_min; the condensed state does not.
+- **Outside the kinetic description.** Mean-field effects on the dispersion,
+  and the coherence of a condensate: the equation keeps occupations, not
+  phases, so a decay is enhanced by stimulated emission, (1 + f)², not by
+  parametric resonance. For a coherently oscillating parent the resonance
+  (the occupation of the first band grows at about q m/2, q the resonance
+  parameter of its coupling to the daughters) has to be slower than what
+  empties the band: scattering, the parent's own decay, expansion. Not
+  integrated either: the exchange between two zero modes of equal mass in
+  forward scattering.
+
+`scripts/check_zero_mode.py` checks the terms against closed forms, the Vegas
+rate and each other; `examples/inflaton_bec.py` runs a condensate decaying
+into a self-interacting boson that thermalizes and condenses in turn, against
+the equilibrium that the initial energy and number fix (`scripts/plot_bec.py`
+draws its checkpoint).
 
 ### Custom collision terms
 
