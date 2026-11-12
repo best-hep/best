@@ -456,9 +456,9 @@ for label, kw in forms.items():
             se.add_process('el', ['Phi', 'l'], ['Phi', 'l'], el_const, neval=NEVAL, nitn=NITN, **kw)
             se.compute_rates(['el'])
     q = se.r_grids['l']
-    # the momentum of the Phi is sampled on [q_min, q_max * domain_extension]
-    a_, b_ = se.q_min / T, se.q_max * se.domain_extension / T
-    gamma = M2_EL * T * T * ((a_ + 1.0) * np.exp(-a_) - (b_ + 1.0) * np.exp(-b_)) / (64.0 * np.pi**3 * q * se.species_dof['l'])
+    # the momentum of the Phi (no zero mode) is sampled from zero to q_max * domain_extension
+    b_ = se.q_max * se.domain_extension / T
+    gamma = M2_EL * T * T * (1.0 - (b_ + 1.0) * np.exp(-b_)) / (64.0 * np.pi**3 * q * se.species_dof['l'])
     r = se.loss_rates['l'] / se.distributions_1d['l'] / gamma
     mean, sigma = r.mean(), r.std(ddof=1) / np.sqrt(r.size)        # the nodes are independent estimates
     check(f"{label}: loss rate / analytic", abs(mean - 1.0) <= K_SIGMA * sigma + ROUNDING,

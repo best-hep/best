@@ -53,19 +53,13 @@ def domain(dims):
     lo += [0.0, 0.0]; hi += [1.0, 1.0]
     return np.array(lo), np.array(hi)
 
-def mc(sol, target, p1, dims, side, reps=8, n=200000, importance=False):
-    """Monte Carlo of the loss (FW) column. importance=True draws the free legs'
-    momenta from e^{-q/2} (needed for 2->4, where the uniform box is too sparse)."""
+def mc(sol, target, p1, dims, side, reps=8, n=200000):
+    """Monte Carlo of the loss (FW) column."""
     f = integrand(sol, target, p1, side); lo, hi = domain(dims)
     acc = acc2 = 0.0; N = 0
     for _ in range(reps):
-        x = lo + rng.random((n, dims)) * (hi - lo); w = np.full(n, np.prod(hi - lo))
-        if importance:
-            cols = [0] + [2 + 3 * k for k in range((dims - 4) // 3)]
-            for c in cols:
-                q = 0.05 + rng.exponential(2.0, n); x[:, c] = q
-                w *= (2.0 * np.exp((q - 0.05) / 2.0)) / (hi[c] - lo[c])
-        o = f(x)[:, 1] * w
+        x = lo + rng.random((n, dims)) * (hi - lo)
+        o = f(x)[:, 1] * np.prod(hi - lo)
         acc += o.sum(); acc2 += (o * o).sum(); N += n
     return abs(acc / N), np.sqrt(max(acc2 / N - (acc / N) ** 2, 0.0) / N)
 
@@ -131,7 +125,7 @@ for p1 in (0.5, 2.0):
 for nout, dims in ((3, 7), (4, 10)):
     sol = build(['A', 'A'], ['B'] * nout, {'A': (0.0, 'mb', 'thermal'), 'B': (0.0, 'mb', 'one')})
     for p1 in (1.0, 3.0):
-        m, e = mc(sol, 'A', p1, dims, 'input', reps=20, importance=(nout == 4))
+        m, e = mc(sol, 'A', p1, dims, 'input', reps=20)
         check(f"2->{nout} input loss, p = {p1}", m, e, loss_2in(p1, 0.0, 0.0, Phi_massless(nout)))
 # F. detailed balance per sample, mixed statistics
 print("Detailed balance at equilibrium, 2->3 with Bose and Fermi species (BW/FW per sample)")
